@@ -1,0 +1,95 @@
+# Summary
+
+- [Introduction](README.md)
+- [Architecture & The Conversation Loop](src/architecture/index.md)
+  - The Core Loop
+  - System Prompt Construction
+  - Message Flow & Role Alternation
+  - The Turn Lifecycle
+  - Parallel Tool Execution
+  - Context Compression
+  - Provider Abstraction Layer
+  - Streaming vs Non-Streaming
+  - Interrupt Handling
+  - Summary Diagram
+- [Guardrails & Safety](src/guardrails/index.md)
+  - Prompt-Level Guardrails
+  - Runtime Guardrails: ToolCallGuardrailController
+  - Destructive Command Approval
+  - Secret Redaction
+  - File Safety
+  - Message Sanitization
+  - SSL Guard
+  - Error Classification & Recovery
+  - Summary Table: Guardrail Layers
+  - Guardrail Interaction Diagram
+- [Agent Spawning & Delegation](src/spawning/index.md)
+  - Two Mechanisms Compared
+  - Synchronous Delegation (delegate_task)
+  - Asynchronous Process Spawning
+  - Worktree Mode
+  - Why Spawn?
+  - Kanban: The Durable Work Queue
+  - Spawning Diagram
+- [Self-Correction](src/self-correction/index.md)
+  - Error Sources
+  - LLM API Error Classification
+  - Tool Execution Error Classification
+  - Self-Correction During a Turn
+  - Compression Failure Recovery
+  - Fallback Chain
+  - Background Review (Post-Turn)
+  - Summary Table: Error Handling
+- [Termination Conditions](src/termination/index.md)
+  - Normal Turn Termination
+  - Iteration Budget Exhaustion
+  - Guardrail Halts
+  - API Fatal Errors
+  - User Interrupt
+  - Session-Level Termination
+  - Cron Job Termination
+  - Subagent Termination
+  - Summary Diagram
+- [LLM Influence on Behavior](src/llm-influence/index.md)
+  - The Provider Adapter Layer
+  - Tool Schema Influence
+  - Multimodal Variation
+  - Reasoning / Thinking Tokens
+  - Context Length Sensitivity
+  - Temperature and Sampling
+  - Max Completion Tokens
+  - Provider-Specific Streaming
+  - Model Personality Drift
+  - Summary: Model Behavior Matrix
+- [Skill Creation & Management](src/skills/index.md)
+  - Skill Format (YAML Frontmatter + Markdown Body)
+  - Skill Directories and Discovery
+  - Loading at Session Start (Platform/Environment Gating)
+  - System Prompt Integration
+  - Runtime Dispatch (Explicit Loading, Slash Commands, Bundles)
+  - Preprocessing (Templates, Inline Shell)
+  - Provenance and the Security Model
+  - The Curator Background System
+  - Usage Telemetry and Persistence
+  - Architecture Diagrams
+- [Tool Creation & Dispatch](src/tools/index.md)
+  - Architecture Overview
+  - Registration (tools/registry.py)
+  - Schema Generation (model_tools.py)
+  - Dispatch (handle_function_call)
+  - Parallelization and Concurrency
+  - Security Boundaries
+  - Adding a Tool (Three-File Pattern)
+  - Summary: Core Design Principles
+- [Core Memory Design](src/memory/index.md)
+  - Architecture Overview
+  - Core Memory (tools/memory_tool.py)
+  - Session Storage (hermes_state.py)
+  - Session Search (FTS5)
+  - Pluggable Memory Providers
+  - Auxiliary Client System
+  - Complete Turn Data Flow
+  - Session Management Boundaries
+  - Performance Characteristics
+  - Security Boundaries
+  - Full Code Map
