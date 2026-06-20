@@ -417,43 +417,90 @@ The memory system sits at the intersection of prompt injection and data exfiltra
 
 ---
 
-## 9. Lifecycle Diagram
+## 10. Lifecycle Diagram
+
+The diagram below shows the system prompt as a **static header** above the loop (it is assembled once at startup and never modified mid-session), and the **per-turn flow** as a cycle that includes the internal tool-call sub-loop.
 
 ```
-Agent startup
-    │
-    ▼
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│  MemoryStore    │     │   SessionDB()    │     │  MemoryManager()    │
-│ load_from_disk()│     │ apply WAL + init │     │ add_provider(ext?)  │
-│ snapshot frozen │     │ schema + FTS5    │     │ initialize_all(...) │
-└────────┬────────┘     └────────┬─────────┘     └──────────┬──────────┘
-         │                       │                          │
-         └───────────────────────┼──────────────────────────┘
-                                 ▼
-                         System prompt assembly
-                                 │
-                    ┌────────────┴────────────┐
-                    │     Per-turn loop        │
-                    │                         │
-                    ▼                         ▼
-         prefetch_all(query)          sync_all(user, asst)
-         (blocks briefly)              (background executor)
-                    │                         │
-                    ▼                         ▼
-         Inject <memory-context>    Persist to external backend
-         into user turn              + queue_prefetch for next turn
-                    │
-                    ▼
-         on_turn_start(turn#, msg)
-         on_pre_compress(messages) ──► compress ──► on_session_switch(...)
-                    │
-                    ▼
-         Session boundary (/reset, /new, exit, expiry)
-                    │
-         on_session_end(messages)
-         shutdown_all() ──► drain executor ──► provider.shutdown()
+┌──────────────────────────────────────────────────────────────────────┐
+│  SYSTEM PROMPT (assembled once at startup — frozen for the session) │
+│  · identity, date/time, tool schemas                               │
+│  · MEMORY.md / USER.md snapshot                                    │
+└──────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                         PER-TURN LOOP                                │
+│                                                                      │
+│   ┌─────────────┐                                                    │
+│   │  prefetch   │ ← warmed by queue_prefetch from PREVIOUS turn      │
+│   │  external   │                                                    │
+│   │  memory     │                                                    │
+│   └──────┬──────┘                                                    │
+│          ▼                                                           │
+│   inject <memory-context> into user message                        │
+│          │                                                           │
+│          ▼                                                           │
+│   ┌─────────────────────────────┐                                    │
+│   │       USER MESSAGE          │                                    │
+│   └─────────────┬───────────────┘                                    │
+│                 │                                                      │
+│                 ▼                                                      │
+│   ┌──────────────────────────────────────────────────────────────┐  │
+│   │              TOOL-CALL SUB-LOOP (within one turn)            │  │
+│   │                                                              │  │
+│   │   ┌─────────┐                                               │  │
+│   │   │  LLM    │───► generates assistant message               │  │
+│   │   │generate │     (may contain tool_calls[])                │  │
+│   │   └────┬────┘                                               │  │
+│   │        │                                                      │  │
+│   │        ▼                                                      │  │
+│   │   tool_calls present?                                         │  │
+│   │        │                                                      │  │
+│   │    YES ▼                                                      │  │
+│   │   execute tool(s) ──► append results ──► back to LLM        │  │
+│   │        │                                    generate          │  │
+│   │        └────────────────────────────┐                       │  │
+│   │                                       │  (repeat)           │  │
+│   │    NO  ▼                              │                       │  │
+│   │   final assistant text ───────────────┘                       │  │
+│   │                                                               │  │
+│   └──────────────────────┬────────────────────────────────────────┘  │
+│                          │                                            │
+│                          ▼                                            │
+│   ┌──────────────────────────────────────────────────────────────┐   │
+│   │  FINALISE TURN                                                │   │
+│   │  · append user + assistant messages to SessionDB              │   │
+│   │  · sync_all(user, assistant) ─────► background executor       │   │
+│   │  · queue_prefetch(user) ─────────► background executor       │   │
+│   │    (warms cache for NEXT turn)                                │   │
+│   └──────────────────────┬───────────────────────────────────────┘   │
+│                          │                                            │
+│                          └───────────────────────────────────────────►│
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+Other lifecycle events (outside the hot turn path):
+· on_turn_start(turn#, msg)               — optional provider hook
+· on_pre_compress(messages) ──► compress ──► on_session_switch(...)
+· on_session_end(messages) / shutdown_all() — on /reset, /new, exit
 ```
+
+### Tool-call sub-loop
+
+Inside a single user-visible turn, the LLM may request zero or more tool calls. When tool calls are present:
+
+1. The agent **pauses completion generation**.
+2. It **executes every tool call** in the `tool_calls` array (some in parallel if safe, some serialised if stateful).
+3. It appends each result back to the conversation history as a `role="tool"` or tool-result message (encoding varies by API provider — OpenAI Chat Completions, Anthropic Messages, or Codex Responses).
+4. It sends the **expanded message list** back to the LLM for another completion.
+5. This repeats until the assistant returns a message with no `tool_calls`, or the safety iteration cap is reached.
+
+The user sees the final assistant text only after this sub-loop terminates. Tool-call iterations are not billed or logged as separate turns; they are internal assistant-generation passes within the same turn boundary.
+
+### Why this matters for caching
+
+The system prompt is frozen and identical on every API request, so providers with prefix caching (OpenAI, Anthropic, DeepSeek) serve it from cache. The growing portion is the `user` + `assistant` + `tool_result` pairs. Because the system prompt never moves, grows, or changes, the cache key remains stable for the session lifetime.
 
 ---
 
