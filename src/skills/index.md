@@ -94,6 +94,10 @@ EXCLUDED_SKILL_DIRS = frozenset({
 
 This centralized exclusion list ensures that dependencies, virtualenvs, VCS metadata, and caches never leak into the skill index. The walker follows symbolic links (so a skill can be a symlink to a checked-out repository elsewhere) but still validates the resulting path.
 
+### Support-Directory Exclusion
+
+When a `SKILL.md` exists in a skill directory, the four blessed subdirectories (`references/`, `templates/`, `scripts/`, `assets/`) are pruned from discovery — they are listed in the skill's loaded content but not scanned as separate skills. `SKILL_SUPPORT_DIRS` and `is_skill_support_path()` / `is_excluded_skill_path()` in `skill_utils.py` enforce this, preventing support files from being misidentified as standalone skills.
+
 ### Local and External Directories
 
 `agent/skill_utils.py::get_all_skills_dirs()` returns the full search path:
