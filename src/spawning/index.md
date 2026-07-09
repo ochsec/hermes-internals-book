@@ -35,11 +35,15 @@ delegate_task(tasks=[
 1. **Parent sends goal + context** — The parent Hermes instance calls `delegate_task`.
 2. **Child agent instantiated** — A new `AIAgent` is created with:
    - Isolated conversation history (empty except for the system prompt and the goal)
-   - A copy of the parent's tool definitions (filtered by `toolsets` parameter if specified)
+   - The parent's full toolset — subagents **always inherit the parent's toolsets** automatically. The model-facing `toolsets` argument was removed; the child gets the parent's tool definitions without the model needing to specify them. MCP toolsets are inherited by default (`delegation.inherit_mcp_toolsets`, default true).
    - Its own `IterationBudget` capped at `delegation.max_iterations` (default 50)
 3. **Child runs independently** — The child executes the loop until it returns text or hits its iteration budget.
 4. **Summary returned** — The child returns a condensed summary (not the full conversation). The parent receives this summary as a tool result.
 5. **Parent resumes** — The parent sees the summary in its next loop iteration and continues.
+
+### Security: No Model-Controlled ACP Transport
+
+The delegate ACP (Agent Context Protocol) transport was removed from model control. The model cannot choose to spawn subagents via ACP — delegation is always handled through the internal `delegate_task` tool path, preventing a compromised model from exfiltrating context through an ACP channel.
 
 ### Isolation Guarantees
 
@@ -51,7 +55,7 @@ delegate_task(tasks=[
 ### Roles: Leaf vs Orchestrator
 
 - **Leaf** (default) — A focused worker that cannot re-delegate. Suitable for single concrete tasks.
-- **Orcstrator** — Can call `delegate_task` itself to spawn further workers, bounded by `delegation.max_spawn_depth`. Useful for hierarchical task decomposition.
+- **Orchestrator** — Can call `delegate_task` itself to spawn further workers, bounded by `delegation.max_spawn_depth`. Useful for hierarchical task decomposition. (Note: orchestrator spawning is currently disabled by default — `max_spawn_depth=1` — and can be enabled via config.)
 
 ### Configuration
 

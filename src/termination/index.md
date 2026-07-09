@@ -91,10 +91,15 @@ Sessions are stored in `hermes_state.py` (SQLite), which manages:
 
 Cron jobs (`cronjob` tool, `hermes cron`) have their own termination conditions:
 
-- **3-minute hard interrupt** per tick — `cron/scheduler.py` kills runs that exceed this.
+- **Pre-run script timeout** — `_DEFAULT_SCRIPT_TIMEOUT = 3600` (1 hour), configurable via `cron.script_timeout_seconds`. Previously 120 seconds.
 - `.tick.lock` file — Prevents duplicate execution across processes.
 - **Empty stdout = silent** — If a `no_agent=True` script produces no output, nothing is delivered.
 - **Non-zero exit / timeout** — Sends an error alert.
+- **Interrupted jobs** — Pre-kill output is suppressed; only post-completion output is delivered to avoid partial/garbled messages.
+- **Interpreter shutdown** — Delivery and dispatch are skipped when the Python interpreter is shutting down to avoid errors during teardown.
+- **Gateway shutdown drain** — In-flight cron jobs are drained before the gateway kills workers, making the shutdown visible to cron work.
+- **Security** — The scheduler backstop fails closed when the validator errors, and `base_url` overrides that could exfiltrate provider credentials are blocked.
+- **TERMINAL_CWD isolation** — Each job gets an isolated working directory, and the `TERMINAL_CWD` lock is released even when the job body raises an exception.
 
 ## 5.8 Subagent Termination
 

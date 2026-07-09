@@ -62,6 +62,10 @@ These files are read **once** at agent startup, parsed into entries delimited by
 
 Entries are stored as a flat list separated by `\n§\n`. Deduplication (`dict.fromkeys`) runs at load time. The four tool actions are `add`, `replace`, `remove`, and `read`. `replace` and `remove` use substring matching rather than IDs — the model refers to `"old_text"` and the store finds the first entry containing it. When multiple entries match, the tool returns an error with previews so the caller can disambiguate.
 
+#### Batch operations
+
+The `apply_batch(target, operations)` method enables multiple `add`/`replace`/`remove` operations in a single atomic call. The tool exposes this via the `operations` array parameter — each item is `{action, content?, old_text?}`. The batch works on a copy and only commits to disk if every operation validates, so a single poisoned op rejects the whole batch without corrupting the file.
+
 #### Snapshot vs. live state
 
 ```python
@@ -195,7 +199,7 @@ A `compression_locks` table prevents two compressors from racing on the same ses
 
 ### 3.4 Declarative schema evolution
 
-Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 16`).
+Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 19`).
 
 ---
 
@@ -249,7 +253,15 @@ The tool accepts a `profile` argument for read-only access to another profile’
 
 ## 5. Pluggable Memory Providers (`agent/memory_provider.py`, `agent/memory_manager.py`, `plugins/memory/`)
 
-Beyond the built-in file-backed memory and session DB, Hermes supports external memory backends — Honcho, Mem0, Supermemory, Byterover, Hindsight, Holographic, OpenViking, RetainDB, and any user-installed plugin implementing the `MemoryProvider` ABC.
+Beyond the built-in file-backed memory and session DB, Hermes supports external memory backends — Honcho, Mem0 (cloud and self-hosted), Supermemory, Byterover, Hindsight, Holographic, OpenViking, RetainDB, and any user-installed plugin implementing the `MemoryProvider` ABC.
+
+### Mem0 Self-Hosted Mode
+
+Mem0 can run in either cloud or self-hosted mode. The self-hosted mode includes a dashboard backend and configurable recall tuning (rerank, host routing precedence). The setup wizard supports both modes, and the SDK is lazy-installed (like honcho/hindsight) so missing dependencies don't block startup.
+
+### Holographic Memory FTS5 Sanitizer
+
+The Holographic memory provider applies an FTS5 query sanitizer to `search_facts` and natural-language recall queries, preventing malformed FTS5 syntax from causing search failures. This mirrors the same sanitization logic used by `session_search`.
 
 ### 5.1 The one-external-provider rule
 
@@ -345,7 +357,7 @@ Provider output that reaches the UI must not leak raw `<memory-context>` tags or
 
 ### 5.7 Skill-scaffolding stripping
 
-When the user invokes a `/skill` or `/bundle`, Hermes expands the turn into a model-facing message embedding the entire skill body. Feeding that verbatim to memory providers would pollute their stores with prompt scaffolding. `MemoryManager._strip_skill_scaffolding()` extracts just the user’s actual instruction before passing it to `prefetch_all` and `sync_all`.
+When the user invokes a `/skill` or `/bundle`, Hermes expands the turn into a model-facing message embedding the entire skill body. Feeding that verbatim to memory providers would pollute their stores with prompt scaffolding. `MemoryManager._strip_skill_scaffolding()` extracts just the user’s actual instruction before passing it to `prefetch_all` and `sync_all`. This stripping is applied to **all** providers, not just a single provider — it is a universal preprocessing step.
 
 ---
 
@@ -381,7 +393,7 @@ Certain models have strict server-side contracts. The auxiliary client returns `
 
 | Data | Destination | Trigger | Notes |
 |---|---|---|---|
-| Curated memory entries (`add`/`replace`/`remove`) | `MEMORY.md`, `USER.md` | Tool call | Atomic temp-file + rename |
+| Curated memory entries (`add`/`replace`/`remove`/`batch`) | `MEMORY.md`, `USER.md` | Tool call | Atomic temp-file + rename; batch is all-or-nothing |
 | Full message history | `state.db` → `messages` | Every turn | Includes tool_calls JSON, reasoning fields |
 | Session metadata (model, tokens, cost, title) | `state.db` → `sessions` | Session start / end / compression | `update_token_counts` increments per API call |
 | FTS5 index | `messages_fts`, `messages_fts_trigram` | Triggered on INSERT/UPDATE/DELETE | Rebuilt on schema migration |
@@ -504,7 +516,7 @@ The system prompt is frozen and identical on every API request, so providers wit
 
 ---
 
-## 10. Testing Philosophy
+## 10b. Testing Philosophy
 
 The Hermes codebase treats memory-related tests as integration-critical:
 

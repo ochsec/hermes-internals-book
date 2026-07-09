@@ -8,15 +8,20 @@ Every supported LLM provider has a dedicated adapter in `agent/`:
 
 | Provider | Adapter File | Key Quirk |
 |----------|--------------|-----------|
-| Anthropic | `anthropic_adapter.py` | Native tool format, prompt caching via `cache_control` |
+| Anthropic | `anthropic_adapter.py` | Native tool format, prompt caching via `cache_control`, ordered replay cache markers |
 | OpenAI | Built into loop | Standard function calling, no streaming tool calls until recently |
-| Gemini | `gemini_native_adapter.py`, `gemini_cloudcode_adapter.py` | Different tool schema, quota sharing across pool entries |
+| Gemini | `gemini_native_adapter.py`, `gemini_cloudcode_adapter.py` | Different tool schema, quota sharing across pool entries, consecutive same-role content merging |
+| Vertex AI | `vertex_adapter.py` | Google Vertex AI for Gemini (OAuth2), IAM-based auth |
 | Bedrock | `bedrock_adapter.py` | IAM role auth, no streaming |
-| Codex | `codex_responses_adapter.py` | Responses API, SSE error frames |
+| Codex | `codex_responses_adapter.py` | Responses API, SSE error frames, commentary-phase preamble routed to reasoning channel |
 | Azure | `azure_identity_adapter.py` | Entra ID auth, no API key |
-| Local/Ollama | Handled generically | Must set `num_ctx` manually; small context crashes tool use |
+| Local/Ollama | Handled generically | Must set `num_ctx` manually; vision detection via `/api/show`; live vLLM context limits honored |
 | Copilot | `copilot_acp_client.py` | ACP (Agent Context Protocol) transport |
+| xAI Grok | Native | OAuth device-code flow; grok-4.5 GA with reasoning-effort allowlist |
 | Nous Portal | Native | OAuth + quota entitlements |
+| Z.AI (GLM) | Native | Overload adaptive backoff for GLM-5.2 (HTTP 1305) |
+| Tencent | Native | Hy3 GA model in catalog |
+| vLLM | Native | Token-based output-cap error parsing, live context limits from endpoint |
 
 Adapters translate between Hermes's internal representation (OpenAI-style messages + tool schemas) and each provider's native format. They also handle streaming parsers, token counting, and error extraction.
 
@@ -43,7 +48,11 @@ Hermes supports images, video, and audio via the `vision`, `video`, and `tts` to
 - **Gemini** — Images uploaded via the Files API, referenced by URI.
 - **Local models** — Depends on server support (Ollama, LM Studio, etc.).
 
-`agent/image_routing.py` selects the appropriate provider based on `model.supports_vision` and `auxiliary.vision.provider` config.
+`agent/image_routing.py` selects the appropriate provider based on `model.supports_vision` and `auxiliary.vision.provider` config. In auto mode, Hermes prefers the main model's native vision capability over falling back to an auxiliary vision model, so images are analyzed by the model already in context when possible.
+
+### Ollama Vision Detection
+
+For local Ollama models, vision capability is detected by querying the `/api/show` endpoint, which exposes the model's modality configuration. This allows Hermes to route images to local vision-capable models (e.g. LLaVA) without requiring the user to manually configure `supports_vision`.
 
 ### Image Error Handling
 
@@ -78,6 +87,10 @@ Different models have different context lengths, and this dramatically affects b
 | Ollama defaults | 2K–4K | Completely unusable for tool use without `num_ctx` boost |
 
 `agent/model_metadata.py` estimates token counts per message. When the estimate crosses `compression.threshold`, compression fires. Small-context models spend a disproportionate fraction of their budget on the system prompt + tool schemas, leaving little room for conversation.
+
+### vLLM Live Context Limits
+
+For local vLLM endpoints, Hermes queries the server's model metadata to honor live context limits rather than relying on hardcoded estimates. The vLLM token-based output-cap error format (`"This model's maximum output tokens"`) is parsed to detect when the model is forced to truncate, triggering a retry or compression rather than death-looping on repeated over-cap 400 errors.
 
 ## 6.6 Temperature and Sampling
 
@@ -120,11 +133,14 @@ Swapping models mid-conversation (fallback) can cause "personality drift" — th
 
 | Model | Tool Adherence | Context | Streaming | Multimodal | Reasoning |
 |-------|---------------|---------|-----------|------------|-----------|
-| Claude Sonnet | Excellent | 200K | Native | Yes | Hidden |
-| GPT-4o | Very Good | 128K | Standard | Yes | None visible |
-| Gemini Pro | Good | 1M | Non-standard | Yes | None visible |
+| Claude Sonnet 4 | Excellent | 200K | Native SSE | Yes | Hidden |
+| GPT-4o / GPT-5.5 | Very Good | 128K / 272K | Standard | Yes | Codex commentary channel |
+| Gemini Pro 2.5 | Good | 1M+ | Non-standard | Yes | None visible |
+| Grok-4.5 | Good | 256K | Standard | Yes (Imagine) | Reasoning-effort allowlist |
 | DeepSeek-R1 | Good | 128K | Standard | No | Explicit blocks |
+| GLM-5.2 (Z.AI) | Good | 128K | Standard | No | Overload adaptive backoff |
 | Llama 3 70B | Moderate | 128K | Standard | No | None |
-| Local 7B | Poor | 4K–8K | Varies | Varies | None |
+| Local 7B (Ollama) | Poor | 4K–8K | Varies | Via `/api/show` detection | None |
+| vLLM endpoints | Varies | Live metadata | Varies | Varies | None |
 
 A model's position in this matrix determines which guardrails fire most often, how frequently compression runs, and whether multimodal or reasoning features are available.

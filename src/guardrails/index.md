@@ -139,8 +139,11 @@ If the auxiliary model returns "safe", the command executes without interruption
 
 - **Off by default** (`security.redact_secrets: false`).
 - When enabled, all tool output (terminal stdout, `read_file`, web content, subagent summaries) is scanned for patterns resembling API keys, tokens, and passwords before entering the conversation context.
-- Patterns cover: `sk-` (OpenAI), `ghp_` (GitHub), AWS keys, JWT tokens, base64-encoded credentials, and generic hex strings.
+- Patterns cover: `sk-` (OpenAI), `ghp_` (GitHub), AWS keys, JWT tokens, base64-encoded credentials, generic hex strings, Slack App-Level tokens (`xapp-`), Fireworks AI API keys, bare-token credentials in URL userinfo, database connection strings, and passwords in lowercase/dotted config keys.
 - Secrets are replaced with `[REDACTED-<hash>]` so the model knows something was hidden without seeing the value.
+- Prefix secrets in file reads use a non-reusable sentinel to prevent repeated exposure.
+- Redaction is applied to background process output and foreground environment dumps.
+- Tool-call arguments in conversation history are **not** redacted (this was found to break auth headers by quote-eating); redaction is scoped to tool results, not the model's own call parameters.
 
 **Important**: `security.redact_secrets` is snapshotted at import time. Changing it mid-session has no effect — a new session is required.
 
@@ -174,13 +177,29 @@ If the auxiliary model returns "safe", the command executes without interruption
 
 `agent/error_classifier.py` categorizes API errors into `FailoverReason` enums:
 
-- `RATE_LIMIT` — Back off and retry or rotate credentials.
-- `CONTEXT_LENGTH` — Trigger compression or fall back to a larger-context model.
-- `AUTH_EXPIRED` — Refresh OAuth or prompt user to re-authenticate.
-- `QUOTA_EXHAUSTED` — Route to fallback model.
-- `MALFORMED_REQUEST` — Fix message sanitization and retry.
-- `SERVER_ERROR` — Exponential backoff.
-- `UNKNOWN` — Log and abort turn.
+- `auth` — Transient auth (401/403) — refresh/rotate credentials.
+- `auth_permanent` — Auth failed after refresh — abort.
+- `billing` — 402 or confirmed credit exhaustion — rotate immediately.
+- `rate_limit` — 429 or quota-based throttling — backoff then rotate.
+- `upstream_rate_limit` — Upstream model rate-limited (aggregator 429) — fallback to different model, not credential rotation.
+- `overloaded` — 503/529 — provider overloaded, backoff.
+- `server_error` — 500/502 — internal server error, retry.
+- `timeout` — Connection/read timeout — rebuild client + retry.
+- `ssl_cert_verification` — TLS certificate verification failure — fail fast with actionable guidance.
+- `context_overflow` — Context too large — compress, not failover.
+- `payload_too_large` — 413 — compress payload.
+- `image_too_large` — Native image part exceeds provider's per-image limit — shrink and retry.
+- `model_not_found` — 404 or invalid model — fallback to different model.
+- `provider_policy_blocked` — Aggregator blocked the only endpoint due to data/privacy policy.
+- `content_policy_blocked` — Provider safety filter rejected this prompt — deterministic, don't retry unchanged.
+- `format_error` — 400 bad request — abort or strip + retry.
+- `invalid_encrypted_content` — Responses replay blob rejected — strip replay state and retry.
+- `multimodal_tool_content_unsupported` — Provider rejected list-type content in tool messages — downgrade to text and retry.
+- `thinking_signature` — Anthropic thinking block signature invalid.
+- `long_context_tier` — Anthropic "extra usage" tier gate.
+- `oauth_long_context_beta_forbidden` — Anthropic OAuth subscription rejects 1M context beta — disable beta and retry.
+- `llama_cpp_grammar_pattern` — llama.cpp json-schema-to-grammar rejects regex escapes in `pattern`/`format` — strip from tools and retry.
+- `unknown` — Unclassifiable — retry with backoff.
 
 Each classification drives a different recovery strategy in `conversation_loop.py`.
 
@@ -192,9 +211,10 @@ Each classification drives a different recovery strategy in `conversation_loop.p
 | Tool loop guardrails | Exact/same-tool/no-progress counters | `ToolCallGuardrailController` | `hard_stop_enabled: false` |
 | Destructive approval | Human or auxiliary LLM | `tool_dispatch_helpers.py` | `approvals.mode: off` or `--yolo` |
 | Secret redaction | Regex masking | `agent/redact.py` | `security.redact_secrets: false` |
-| File safety | Atomic writes, backups, path guards | `agent/file_safety.py` | none (always active) |
+| File safety | Atomic writes, backups, path guards, credential-path blocking | `agent/file_safety.py` | none (always active) |
 | Message sanitization | Surrogate/control-char removal | `agent/message_sanitization.py` | none (always active) |
-| SSL validation | Certificate pinning | `agent/ssl_guard.py` | `ssl.verify: false` |
+| SSL validation | Certificate pinning, fail-fast on verification failure | `agent/ssl_guard.py` | `ssl.verify: false` |
+| Error classification | 23 `FailoverReason` values driving recovery | `agent/error_classifier.py` | per-error retry/fallback config |
 
 ## 2.10 Guardrail Interaction Diagram
 

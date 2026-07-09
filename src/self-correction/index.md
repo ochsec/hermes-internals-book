@@ -18,14 +18,20 @@ Each source has its own classification and recovery path.
 
 | Enum | Triggers | Recovery |
 |------|----------|----------|
-| `RATE_LIMIT` | HTTP 429, `Retry-After` header | Exponential backoff + credential pool rotation |
-| `CONTEXT_LENGTH` | "context length", "too long" | Compress history or fall back to larger-context model |
-| `AUTH_EXPIRED` | "expired", "invalid token" | Refresh OAuth or prompt re-auth |
-| `QUOTA_EXHAUSTED` | "quota", "billing", "insufficient" | Rotate to fallback model |
-| `MALFORMED_REQUEST` | "invalid json", "bad request" | Sanitize messages and retry |
-| `SERVER_ERROR` | HTTP 500, 503, 502 | Jittered backoff (up to 5 retries) |
-| `MODEL_UNAVAILABLE` | "model not found", "deprecated" | Switch to fallback model |
-| `UNKNOWN` | Everything else | Log and abort turn |
+| `auth` | HTTP 401/403 (transient) | Refresh/rotate credentials |
+| `auth_permanent` | Auth failed after refresh | Abort turn |
+| `billing` | HTTP 402, credit exhaustion, Anthropic "out of extra usage" 400 | Rotate to fallback model |
+| `rate_limit` | HTTP 429, `Retry-After` header (account quota) | Exponential backoff + credential pool rotation |
+| `upstream_rate_limit` | Aggregator 429 (model rate-limited, user key healthy) | Fallback to different model (no credential rotation) |
+| `overloaded` | 503/529, "service is temporarily overloaded" | Adaptive backoff (provider-specific) |
+| `server_error` | HTTP 500, 503, 502 | Jittered backoff (up to 5 retries) |
+| `timeout` | Connection/read timeout, HTTP 408 | Rebuild client + retry |
+| `ssl_cert_verification` | TLS handshake failure | Fail fast with fix hints (no retry) |
+| `context_overflow` | "context length", "too long" | Compress history or fall back to larger-context model |
+| `model_not_found` | 404, "model not found", OpenRouter "no tool use" 404 | Switch to fallback model |
+| `content_policy_blocked` | Provider safety filter, MiniMax "new_sensitive" | Don't retry unchanged; inform user |
+| `format_error` | "invalid json", 400 bad request | Sanitize messages and retry |
+| `unknown` | Everything else | Retry with backoff |
 
 ### The `_pool_may_recover_from_rate_limit` Gate
 
@@ -45,6 +51,14 @@ def jittered_backoff(attempt: int, base: float = 1.0, max_delay: float = 60.0) -
 ```
 
 The maximum number of retries is provider-dependent (typically 3–5), with a hard ceiling to prevent runaway loops.
+
+### Z.AI/GLM-5.2 Overload Adaptive Backoff
+
+Z.AI Coding Plan models (e.g. GLM-5.2) return a specific overload error (HTTP 1305, "The service may be temporarily overloaded...") that requires a different retry strategy. Standard short-retry loops tend to hammer the same overloaded window. `agent/retry_utils.py` detects this pattern via `is_zai_coding_overload_error()` and applies adaptive backoff:
+
+- **Short attempts** — A bounded number of quick retries (`_ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS`) with minimal delay, to catch transient blips.
+- **Long attempts** — After short attempts are exhausted, switch to longer jittered backoff intervals to ride out sustained overload.
+- The ceiling is computed by `zai_coding_overload_retry_ceiling()`, which sizes the total retry loop so every attempt fits within the provider's overload window.
 
 ## 4.3 Tool Execution Error Classification
 
@@ -66,7 +80,7 @@ For tools that don't return structured JSON, the first 500 characters are inspec
 
 `file_mutation_result_landed()` in `agent/tool_result_classification.py` returns True if a `write_file` or `patch` call successfully modified a file. Even if stderr contains warnings, the call is **not** a failure for guardrail purposes. This prevents the tool loop guardrail from punishing successful edits.
 
-## 4.4 Self-Corception During a Turn
+## 4.4 Self-Correction During a Turn
 
 When a tool fails, the error is injected back into the conversation as a `role="tool"` message. The model sees the error on its next iteration and can choose a different approach. This is the primary self-correction mechanism: **the model observes failure and adapts**.
 
@@ -121,15 +135,22 @@ After a turn completes, `agent/background_review.py` optionally spawns a lightwe
 
 This is a **post-hoc** correction mechanism — it doesn't fix the current turn, but improves the next one.
 
+The review agent is **isolated from the canonical session**: it runs in a forked `AIAgent` that does not participate in session finalization, so its work does not pollute the session's token counts or trigger spurious compression. The auxiliary model used for the review is selectable via `auxiliary.review` config, and the review fork's memory tool is gated on `memory_enabled` to prevent unauthorized writes. The fork respects pinned skills and is scoped to read skills before writing them.
+
 ## 4.8 Summary Table: Error Handling
 
 | Error Type | Detector | Immediate Action | Escalation |
 |------------|----------|------------------|------------|
 | Rate limit 429 | `error_classifier.py` | Backoff + pool rotate | Fallback model |
+| Upstream rate limit | `error_classifier.py` | Fallback to different model | Notify user |
+| Overloaded (503/529) | `error_classifier.py` | Adaptive backoff (Z.AI: short→long) | Fallback model |
+| TLS cert failure | `error_classifier.py` | Fail fast with fix hints | Notify user |
+| Timeout (408) | `error_classifier.py` | Rebuild client + retry | Fallback model |
 | Context overflow | Token estimator | Compress history | Discard oldest |
 | Tool failure | Exit code / JSON key | Inject error result | Guardrail warn/block |
 | Same tool loop | Guardrail controller | Warn → Block → Halt | Turn aborted |
 | Auth expired | `error_classifier.py` | Refresh token | Prompt user |
-| Model unavailable | `error_classifier.py` | Switch to fallback | Notify user |
+| Model not found | `error_classifier.py` | Switch to fallback | Notify user |
+| Content policy blocked | `error_classifier.py` | Don't retry unchanged | Inform user |
 | Compression failure | Compressor try/except | Retry → older compressor | Nuclear delete |
 | Background review miss | Review agent | Queue steer for next turn | None |

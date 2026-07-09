@@ -118,6 +118,8 @@ skills:
 
 `agent/skill_utils.py::get_disabled_skill_names()` resolves both lists. A globally disabled skill stays disabled everywhere; platform-specific additions layer on top. The platform is detected from `HERMES_PLATFORM` or `HERMES_SESSION_PLATFORM`.
 
+Disabled skills can also be suppressed at the CLI/TUI preload level: the `--skills` flag and bundle invocations both respect the `disabled` and `platform_disabled` lists, so a disabled skill is never injected into the system prompt even when explicitly named. This closes a loophole where `--skills noisy-skill` would bypass the gate.
+
 ---
 
 ## 3. The Skills Index and System Prompt Integration
@@ -237,6 +239,10 @@ loading 3 skills together. Treat every skill below as active guidance for this t
 
 Missing skills are noted but do not abort the bundle; the agent receives the ones that exist.
 
+### Stacked Slash-Skill Invocations
+
+Multiple skills can be invoked in a single slash command: `/skill-a /skill-b do XYZ`. The `split_stacked_skill_commands()` function in `agent/skill_commands.py` parses leading slash-skill prefixes and loads each named skill before the user's instruction. `build_stacked_skill_invocation_message()` assembles all skill bodies into one user message, similar to bundle expansion. This enables ad-hoc multi-skill composition without defining a bundle YAML.
+
 ---
 
 ## 5. Preprocessing Pipeline (`agent/skill_preprocessing.py`)
@@ -313,9 +319,23 @@ The "anchor" is the latest of `last_used_at`, `last_viewed_at`, or `last_patched
 
 Built-ins that become eligible for the first time (when `prune_builtins` flips on) are **seeded** with a fresh record anchored to "now," so they are archived only after a full inactivity window, not instantly.
 
+### Cron-Referenced Skills
+
+Skills referenced by active cron jobs are never archived. Before any automatic transition, the curator calls `_cron_referenced_skills()` which reads skill names from `cron.jobs.referenced_skill_names()`. Any skill in that set is skipped entirely, preventing a scheduled job from silently losing its skill dependency.
+
+### External Skill Protection
+
+External skills (from `skills.external_dirs`) are protected from background curation: the write guard prevents the curator from modifying or archiving skills it doesn't own. The external-skill write guard fires during curation just as it does during `skill_manage` operations.
+
+### Restore Name-Prefix Guard
+
+`restore_skill()` no longer matches by name prefix — it requires an exact or single-match resolution. This prevents `hermes curator restore config` from accidentally restoring `config-advanced` or `configuration-management`.
+
 ### LLM Consolidation Pass
 
-After the pure time-based transitions, the curator spawns a **forked AIAgent** running a dedicated review prompt (`CURATOR_REVIEW_PROMPT`). This is an "umbrella-building" pass, not a passive audit. Its goals:
+The LLM consolidation (umbrella-building) pass is **opt-in** — it is off by default. When off, a curator run does only the deterministic inactivity prune (mark stale / archive long-unused skills) and skips the forked aux-model review entirely. Set `curator.consolidate: true` in config (or pass `--consolidate` on the CLI) to opt back into the LLM pass that merges overlapping skills into class-level umbrellas.
+
+When enabled, the curator spawns a **forked AIAgent** running a dedicated review prompt (`CURATOR_REVIEW_PROMPT`). This is an "umbrella-building" pass, not a passive audit. Its goals:
 
 - Identify prefix clusters of related skills (`hermes-config-*`, `pr-*`, `python-*`, etc.)
 - Merge narrow skills into broad **umbrella** skills with labeled subsections

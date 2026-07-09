@@ -4,7 +4,7 @@ The Hermes agent is built around a single, long-running **conversation loop** th
 
 ## 1.1 The Core Loop
 
-The canonical entry point is `AIAgent.run_conversation()` in `run_agent.py`. Despite the file's ~5,400 lines, the loop itself has been extracted into `agent/conversation_loop.py` (~4,450 lines) and is invoked as a thin forwarder from `run_agent`.
+The canonical entry point is `AIAgent.run_conversation()` in `run_agent.py`. Despite the file's ~6,000 lines, the loop itself has been extracted into `agent/conversation_loop.py` (~5,300 lines) and is invoked as a thin forwarder from `run_agent`.
 
 At its heart, the loop is a **single-pass turn processor** with tool-result reinjection:
 
@@ -52,6 +52,11 @@ The loop is **not** a planning-then-executing two-pass system. The LLM sees the 
 | `context_length` | model-dependent | Token budget before compression fires |
 | `compression.threshold` | 0.50 | Fraction of context filled before summarization |
 | `compression.target_ratio` | 0.20 | How much to shrink context when compressing |
+| `compression.protect_first_n` | 3 | Head messages never summarized (in addition to system prompt) |
+| `compression.protect_last_n` | 20 | Recent messages always preserved (~10 full turns) |
+| `compression.codex_gpt55_autoraise` | true | Raise threshold to 85% for Codex GPT-5.5 |
+| `compression.codex_app_server_auto` | native | Codex app-server thread-compaction mode |
+| `prompt_caching.cache_ttl` | "5m" | Anthropic cached-prefix TTL ("5m" or "1h") |
 
 ## 1.2 System Prompt Construction
 
@@ -69,6 +74,10 @@ Components of the system prompt (in order):
 8. **Guardrails** — The `LINT_ERROR_MESSAGE` and tool-use enforcement rules (see Chapter 2).
 
 The assembled prompt is sent on **every** LLM call within the conversation. Changing tools, skills, or config mid-conversation would invalidate the cache, so Hermes requires a `/reset` (new session) for such changes to take effect.
+
+### Prompt Caching TTL
+
+When using Anthropic (native or via OpenRouter), the system prompt prefix is eligible for provider-side caching. The `prompt_caching.cache_ttl` config option controls the cache lifetime: `"5m"` (default) or `"1h"` for long sessions with pauses between turns. This does not change the prompt content — it only tells the provider how long to keep the cached prefix.
 
 ## 1.3 Message Flow & Role Alternation
 
@@ -121,6 +130,31 @@ When the conversation approaches the model's context limit, Hermes compresses hi
 
 Compression is triggered when the ratio of used tokens to context length exceeds `compression.threshold` (default 50%). The target is to shrink to `compression.target_ratio` (default 20%) of the limit. Compression runs **between turns**, never mid-loop, to preserve prompt caching.
 
+### Small-Context Threshold Floor
+
+Models with context windows below 512K tokens (`_SMALL_CTX_WINDOW_LIMIT = 512_000`) are floored at a 0.75 (75%) trigger threshold — raise-only. This prevents compaction from firing when half the window is still free, which caused "compaction thrash" on smaller models. Models at or above 512K keep the configured threshold.
+
+### Protected Messages
+
+Two protection zones prevent compression from eating critical context:
+
+- **`protect_first_n`** (default 3) — Head messages (in addition to the system prompt) are never summarized. This preserves the initial request and first response for session framing.
+- **`protect_last_n`** (default 20) — The most recent ~10 full turns are always preserved intact.
+
+### Codex App-Server Compaction
+
+When running against the Codex app-server (the Codex CLI runtime), Hermes cannot shrink the real thread context — the app server owns it. The `compression.codex_app_server_auto` config controls the mode:
+
+- `native` (default) — Let Codex decide when to compact its own thread.
+- `hermes` — Let Hermes' threshold trigger Codex thread/compact/start.
+- `off` — Hermes will not auto-trigger; Codex may still compact natively.
+
+Additionally, `compression.codex_gpt55_autoraise` (default true) raises the Hermes compaction trigger to 85% for the ChatGPT Codex OAuth route, since the backend caps the effective window at 272K.
+
+### Reasoning Trace Exclusion
+
+Reasoning fields (`reasoning`, `reasoning_content`, `reasoning_details`, `codex_reasoning_items`) are excluded from the compression summary input and from token-count estimates. This prevents large reasoning blobs from inflating the apparent context size and triggering premature compression.
+
 ## 1.7 Provider Abstraction Layer
 
 Hermes supports 20+ LLM providers. The provider abstraction lives in `agent/` with per-provider adapters:
@@ -128,11 +162,12 @@ Hermes supports 20+ LLM providers. The provider abstraction lives in `agent/` wi
 - `agent/anthropic_adapter.py`
 - `agent/bedrock_adapter.py`
 - `agent/gemini_native_adapter.py`
+- `agent/vertex_adapter.py` (Google Vertex AI for Gemini, OAuth2)
 - `agent/codex_responses_adapter.py`
 - `agent/azure_identity_adapter.py`
 - ...and many more
 
-A provider is selected by `model.provider` in config. The loop itself is provider-agnostic; adapters handle schema translation (OpenAI tools ↔ Anthropic tools ↔ Gemini function calling), token counting, and streaming response parsing.
+A provider is selected by `model.provider` in config. The loop itself is provider-agnostic; adapters handle schema translation (OpenAI tools ↔ Anthropic tools ↔ Gemini function calling), token counting, and streaming response parsing. Custom providers can also specify extra HTTP headers via config (`model.extra_headers`) for proxy gateways and enterprise endpoints.
 
 ## 1.8 Streaming vs Non-Streaming
 

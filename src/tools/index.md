@@ -154,6 +154,10 @@ _check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
 
 This is a sweet spot: env-var flips via `hermes tools enable` or live credential file changes propagate within a turn or two, but the cache still amortizes repeated probes. The cache can be explicitly invalidated with `invalidate_check_fn_cache()`.
 
+Transient `check_fn` flakes are suppressed so subagents keep their file/terminal tools even if a probe momentarily returns `False` during a busy gateway session.
+
+Toolset availability is now derived from per-tool `check_fn` results rather than a separate toolset-level check. The old toolset-check helpers have been removed — if every tool in a toolset is unavailable, the toolset is effectively absent; no dedicated check is needed.
+
 ### 2.5 Convenience Helpers
 
 At the bottom of `registry.py` are `tool_error()` and `tool_result()` — thin wrappers around `json.dumps(..., ensure_ascii=False)` that eliminate the repetitive boilerplate of constructing `{"error": "..."}` strings across dozens of tool files. Every tool handler is expected to return a JSON string.
@@ -180,9 +184,17 @@ Toolsets can **compose** other toolsets via `"includes"`. For example, `"debuggi
 
 ### 3.2 The Core Tool List
 
-A shared list `_HERMES_CORE_TOOLS` is the single source of truth for the default CLI and messaging-platform toolsets. Editing it once updates every platform simultaneously. It contains roughly 30+ tools spanning web, terminal, file, vision, browser, skills, planning, memory, session search, code execution, delegation, cron, messaging, Home Assistant, kanban, and computer use.
+A shared list `_HERMES_CORE_TOOLS` is the single source of truth for the default CLI and messaging-platform toolsets. Editing it once updates every platform simultaneously. It contains roughly 30+ tools spanning web, terminal, file, vision, browser, skills, planning, memory, session search, code execution, delegation, cron, messaging, Home Assistant, kanban, computer use, and project workspace management.
 
 Some tools are **gated by `check_fn`** (e.g. `send_message` only appears if the gateway is running; `computer_use` only if the macOS `cua-driver` is installed). Being in `_HERMES_CORE_TOOLS` does not guarantee the tool is sent to the model — `get_tool_definitions()` still evaluates `check_fn`.
+
+### Project Workspace Tools
+
+The `project_list`, `project_create`, and `project_switch` tools (in `tools/project_tools.py`) manage named desktop workspaces. A project anchors the session to a repo/folder, moving the workspace there and updating the sidebar. These tools are desktop-specific and not part of the standard CLI/gateway toolset.
+
+### Tool Override Security
+
+When a plugin registers a `tool_override` for a built-in tool, the authorization is bound to the handler's defining plugin module. The registry enforces opt-in at the dispatch sink to close a direct-import bypass — a plugin cannot override a core tool unless the user has explicitly enabled it via config.
 
 ### 3.3 Platform-Specific Posture: `"coding"`
 
@@ -289,9 +301,9 @@ The search backend is a simple in-memory BM25 index over tokenized tool names, d
 
 `model_tools.handle_function_call()` is the primary dispatcher that routes a model-emitted tool call to its handler. Its responsibilities include:
 
-1. **Argument coercion** (`coerce_tool_args`) — LLMs frequently emit numbers as strings (`"42"`), booleans as strings (`"true"`), or bare scalars where arrays are expected. `coerce_tool_args` compares each argument against the tool's registered JSON Schema and attempts safe conversion. It also wraps bare non-list values in a single-element list when the schema expects `"type": "array"`.
+1. **Argument coercion** (`coerce_tool_args`) — LLMs frequently emit numbers as strings (`"42"`), booleans as strings (`"true"`), or bare scalars where arrays are expected. `coerce_tool_args` compares each argument against the tool's registered JSON Schema and attempts safe conversion. It also wraps bare non-list values in a single-element list when the schema expects `"type": "array"`. JSON-string arguments (where the model emits a string containing valid JSON) are recursively normalized against the schema — e.g. `{"path": "{\"file\": \"foo.py\"}"}` is unwrapped when the schema expects `path` as a string.
 2. **Tool Search bridge dispatch** — If the call is `tool_search`, `tool_describe`, or `tool_call`, it is handled inline. `tool_call` unwraps to the underlying tool name and recurses through `handle_function_call` again, so all downstream hooks see the real tool name.
-3. **Middleware & hooks** — `apply_tool_request_middleware` can mutate arguments. Plugin `pre_tool_call` hooks may block execution. ACP/Zed edit approval runs before any file mutation.
+3. **Middleware & hooks** — `apply_tool_request_middleware` can mutate arguments. Plugin `pre_tool_call` hooks may block execution. A `pre_tool_call` hook returning an `approve` action now escalates to the human approval gate, so plugins can route dangerous patterns through the same interactive approval flow as built-in destructive commands. ACP/Zed edit approval runs before any file mutation.
 4. **Registry dispatch** — Finally, the call reaches `registry.dispatch(name, args, **kwargs)`.
 
 ### 5.2 `registry.dispatch()`
@@ -355,7 +367,11 @@ Concurrent execution uses `concurrent.futures.ThreadPoolExecutor(max_workers=min
 
 If `execute_tool_calls_concurrent()` is called from inside an already-running async context (e.g. the gateway's event loop), the coroutine is offloaded to a disposable thread with its own loop so it can be cancelled on timeout without leaking the worker.
 
-### 6.3 Interrupt Handling
+### 6.3 Wall-Clock Deadline
+
+Concurrent tool execution is bounded by a wall-clock deadline (`_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420` seconds, configurable via `HERMES_CONCURRENT_TOOL_TIMEOUT_S`). This is set above the stock `auxiliary.web_extract` timeout (360s) so the batch guard does not preempt a slow-but-valid summarization. If the deadline expires, pending futures are cancelled and the agent proceeds with whatever results completed in time.
+
+### 6.4 Interrupt Handling
 
 Hermes supports user interrupts (`/stop`, Ctrl-C, new message during gateway execution). When an interrupt is requested:
 
@@ -364,7 +380,7 @@ Hermes supports user interrupts (`/stop`, Ctrl-C, new message during gateway exe
 - In concurrent mode, pending futures are cancelled. Running tools poll `is_interrupted()` (via `tools.interrupt`) and abort at the next safe await point.
 - Worker thread IDs are tracked in `_tool_worker_threads`. On interrupt, the agent fans out the interrupt signal to every active worker tid so `is_interrupted()` returns `True` inside the thread.
 
-### 6.4 Post-Execution
+### 6.5 Post-Execution
 
 Results are collected in the **original tool-call order** and appended to the conversation `messages` list. The agent then enforces a **per-turn budget** on tool result sizes (`enforce_turn_budget`) so a long batch doesn't explode context length. Multimodal tool results (dicts with `_multimodal=True` and a `content` list) are preserved as OpenAI-style content arrays for vision-capable adapters, while text-only adapters receive a `text_summary` fallback.
 
