@@ -155,6 +155,10 @@ Building the index is I/O-bound. Hermes defends against repeated full scans with
 
 If both layers miss, the code walks the filesystem, builds manifest entries, and writes a fresh snapshot for the next process restart.
 
+### Per-Session Discovery Cache (`_find_all_skills`)
+
+`_find_all_skills()` in `tools/skills_tool.py` now caches its results per-session with a 30-second TTL (`_SKILLS_CACHE_TTL_SECONDS`). The cache key is a scan signature computed by `_skills_scan_signature()`: a tuple of `(directory_path, max_mtime)` for each scanned directory and its immediate children (one `scandir` per dir — catches skill add/remove inside categories, which does NOT bump the root dir's mtime), the disabled-set (config-driven — changes with no filesystem mtime bump), and the platform. If the signature matches and the TTL hasn't expired, the cached skill list is returned as shallow copies (callers may mutate the returned dicts without poisoning the cache). If a write races the scan, the signature changes, so the next call re-scans rather than serving a torn result.
+
 ### Compact Categories (Posture-Driven Demotion)
 
 When the agent adopts a coding posture (e.g., pair-programming mode), non-coding categories are "demoted" to a names-only line:
@@ -387,6 +391,14 @@ When the curator consolidates skill X into umbrella Y, any scheduled cron job th
 4. **Prompt-injection scan**: A fixed list of suspicious substrings (`_INJECTION_PATTERNS`) is tested case-insensitively. If any match, the skill is still served (since many legitimate skills quote examples containing the word "ignore"), but a `WARNING`-level log line is emitted so operators can audit.
 
 5. **Traversal guard for linked files**: When `file_path` is provided, `tools.path_security.validate_within_dir()` confirms the resolved target is still inside the skill directory. `..` components are rejected outright.
+
+### Skills Guard Scan Caching (`tools/skills_guard.py`)
+
+`scan_skill_cached()` provides attestation-bound scan caching for the skills security scanner. It computes a `full_content_hash()` — a canonical SHA-256 over relative paths and exact file bytes — and caches the scan result in a `.scan-cache/` directory keyed by the bundle hash, source identity, and scanner version (`SCANNER_VERSION = "skills-guard-v1"`). On a cache hit where the bundle hash, scanner version, source, and source URL all match, the cached `ScanResult` is returned with `scan_provenance.fresh = False`. This avoids re-scanning unchanged skills on every load. The `ScanResult` now carries a `scan_provenance` dict with the full attestation metadata.
+
+### Slash Command Collision Guard
+
+`tools/skills_guard.py` now guards skill slash commands against collisions with core commands and slug collisions between skills. If a skill's slug would shadow a core command name or another skill's slug, the guard rejects it, preventing ambiguous dispatch.
 
 ---
 

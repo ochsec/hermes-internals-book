@@ -11,11 +11,17 @@
   - Provider Abstraction Layer
   - Streaming vs Non-Streaming
   - Interrupt Handling
+  - Persistence Lock
+  - Multimodal Content Override
+  - Fallback Notice
+  - Kanban Stop Scaffolding
   - Summary Diagram
 - [Guardrails & Safety](src/guardrails/index.md)
   - Prompt-Level Guardrails
   - Runtime Guardrails: ToolCallGuardrailController
   - Destructive Command Approval
+  - Smart Approval Observer Hooks
+  - Verification Artifact Cleanup Exemption
   - Secret Redaction
   - File Safety
   - Message Sanitization
@@ -26,6 +32,7 @@
 - [Agent Spawning & Delegation](src/spawning/index.md)
   - Two Mechanisms Compared
   - Synchronous Delegation (delegate_task)
+  - Durable Delegation Persistence
   - Asynchronous Process Spawning
   - Worktree Mode
   - Why Spawn?
@@ -37,6 +44,9 @@
   - Tool Execution Error Classification
   - Self-Correction During a Turn
   - Compression Failure Recovery
+  - Compression Fallback Streak
+  - Fallback Compaction Breaker
+  - Output-Cap Error Exemption
   - Fallback Chain
   - Background Review (Post-Turn)
   - Summary Table: Error Handling
@@ -49,6 +59,7 @@
   - Session-Level Termination
   - Cron Job Termination
   - Subagent Termination
+  - Kanban Worker Termination
   - Summary Diagram
 - [LLM Influence on Behavior](src/llm-influence/index.md)
   - The Provider Adapter Layer
@@ -56,6 +67,7 @@
   - Multimodal Variation
   - Reasoning / Thinking Tokens
   - Context Length Sensitivity
+  - Config Context-Length Short-Circuit
   - Temperature and Sampling
   - Max Completion Tokens
   - Provider-Specific Streaming
@@ -66,9 +78,12 @@
   - Skill Directories and Discovery
   - Loading at Session Start (Platform/Environment Gating)
   - System Prompt Integration
+  - Per-Session Discovery Cache
   - Runtime Dispatch (Explicit Loading, Slash Commands, Bundles)
   - Preprocessing (Templates, Inline Shell)
   - Provenance and the Security Model
+  - Skills Guard Scan Caching
+  - Slash Command Collision Guard
   - The Curator Background System
   - Usage Telemetry and Persistence
   - Architecture Diagrams
@@ -77,6 +92,7 @@
   - Registration (tools/registry.py)
   - Schema Generation (model_tools.py)
   - Dispatch (handle_function_call)
+  - Result Normalization (_normalize_handler_result)
   - Parallelization and Concurrency
   - Security Boundaries
   - Adding a Tool (Three-File Pattern)
@@ -85,6 +101,9 @@
   - Architecture Overview
   - Core Memory (tools/memory_tool.py)
   - Session Storage (hermes_state.py)
+  - Per-Model Usage Attribution
+  - Session Import
+  - Compression Fallback Streak
   - Session Search (FTS5)
   - Pluggable Memory Providers
   - Auxiliary Client System

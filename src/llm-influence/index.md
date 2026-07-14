@@ -21,6 +21,7 @@ Every supported LLM provider has a dedicated adapter in `agent/`:
 | Nous Portal | Native | OAuth + quota entitlements |
 | Z.AI (GLM) | Native | Overload adaptive backoff for GLM-5.2 (HTTP 1305) |
 | Tencent | Native | Hy3 GA model in catalog |
+| DeepInfra | Native | Provider-prefix aliases for model parsing; multimodal routing hardened; TTS availability aligned with refresh |
 | vLLM | Native | Token-based output-cap error parsing, live context limits from endpoint |
 
 Adapters translate between Hermes's internal representation (OpenAI-style messages + tool schemas) and each provider's native format. They also handle streaming parsers, token counting, and error extraction.
@@ -72,7 +73,9 @@ The `/reasoning` slash command lets users toggle how much reasoning is shown:
 - `none` — Strip all reasoning.
 - `minimal` — Show only conclusions.
 - `medium` — Show key reasoning steps.
-- `high` / `xhigh` — Show full reasoning (can be very verbose).
+- `high` / `xhigh` / `max` / `ultra` — Show full reasoning (can be very verbose).
+
+The `ultra` level was added alongside the existing `max` level. Valid reasoning efforts are: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`.
 
 ## 6.5 Context Length Sensitivity
 
@@ -87,6 +90,10 @@ Different models have different context lengths, and this dramatically affects b
 | Ollama defaults | 2K–4K | Completely unusable for tool use without `num_ctx` boost |
 
 `agent/model_metadata.py` estimates token counts per message. When the estimate crosses `compression.threshold`, compression fires. Small-context models spend a disproportionate fraction of their budget on the system prompt + tool schemas, leaving little room for conversation.
+
+### Config Context-Length Short-Circuit
+
+When `model.context_length` is set explicitly in `config.yaml`, `_resolve_active_context_length()` short-circuits the OpenRouter `/models` probe at `get_model_context_length()` step 0. This means non-OpenRouter providers no longer pay the ~2–3 second OpenRouter fetch at every CLI startup just to discover the context window. The config value takes precedence when it is a positive integer.
 
 ### vLLM Live Context Limits
 

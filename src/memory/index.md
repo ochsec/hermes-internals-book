@@ -100,7 +100,7 @@ Every message, session boundary, compression event, and tool call is persisted t
 
 ### 3.1 Schema
 
-Three canonical tables plus two FTS5 virtual tables:
+Five canonical tables plus two FTS5 virtual tables:
 
 ```sql
 CREATE TABLE sessions (
@@ -135,6 +135,7 @@ CREATE TABLE sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -148,6 +149,7 @@ CREATE TABLE messages (
     tool_call_id TEXT,
     tool_calls TEXT,               -- JSON blob
     tool_name TEXT,
+    effect_disposition TEXT,       -- disposition of a tool's effect (v21)
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,
@@ -161,6 +163,27 @@ CREATE TABLE messages (
     active INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE session_model_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode)
+);
+
 CREATE TABLE state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -172,6 +195,26 @@ CREATE TABLE compression_locks (
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+CREATE TABLE async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at REAL NOT NULL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL
+);
 ```
 
 Two FTS5 virtual tables index message content:
@@ -181,13 +224,44 @@ Two FTS5 virtual tables index message content:
 
 Both index `content || ' ' || tool_name || ' ' || tool_calls` so tool-call arguments and tool-result summaries are searchable alongside prose.
 
+### 3.1.1 Per-model usage attribution (`session_model_usage`, v20)
+
+The `sessions` row stores only one `(model, billing_provider)` pair, so a mid-session `/model` switch would attribute every token to the initial model (issue #51607). Schema v20 introduces the `session_model_usage` table to record per-API-call token deltas keyed by `(session_id, model, billing_provider, billing_base_url, billing_mode)`.
+
+`update_token_counts()` now records each incremental call's delta via `_record_model_usage()`, which runs inside the caller's write transaction (after the `sessions` UPDATE) so per-model rows stay consistent with the summary row. When the caller omits the model/provider, `_record_model_usage()` falls back to the values already recorded on the session row — the same COALESCE-from-session behaviour the summary update uses. Absolute cumulative updates (which cannot be split back into per-model routes) are skipped; Insights reconciles any positive residual against the aggregate session row instead.
+
+The v20 migration seeds one usage row per historical session from the aggregate totals on `sessions` using `INSERT OR IGNORE` so it is idempotent: if newer code already wrote a `(session_id, model, provider)` row, the PK conflict skips the stale aggregate rather than doubling it.
+
+### 3.1.2 Durable delegation persistence (`async_delegations`, v21)
+
+The `async_delegations` table provides durable persistence for asynchronous task delegations. Each row records a delegation's lifecycle from dispatch through delivery:
+
+- `delegation_id` — unique identifier for the delegation.
+- `origin_session` / `parent_session_id` — the session that spawned the delegation.
+- `state` — current delegation state (e.g. dispatched, completed).
+- `dispatched_at` / `completed_at` / `updated_at` — lifecycle timestamps.
+- `event_json` / `result_json` / `task_json` — the original task, its result, and the triggering event.
+- `delivery_state` / `delivery_attempts` / `delivery_claim` / `delivery_claimed_at` — delivery tracking for returning results to the origin session.
+- `owner_pid` / `owner_started_at` — the process that owns the delegation at any given time.
+
+An index on `(delivery_state, completed_at)` supports efficient polling for pending deliveries.
+
+### 3.1.3 `effect_disposition` on messages
+
+The `messages` table carries an `effect_disposition TEXT` column (v21) that tracks the disposition of a tool's effect — for example, whether a tool result was a side effect (e.g. a file written, a command executed) or a direct response (e.g. a query result returned inline). `add_message()` accepts `effect_disposition` as an optional parameter and persists it alongside the message. `get_messages()` returns it in each message dict when present. This metadata is used by downstream consumers to distinguish tool calls that changed the world from those that merely returned data.
+
+### 3.1.4 Compression fallback streak
+
+The `sessions.compression_fallback_streak INTEGER NOT NULL DEFAULT 0` column (v21) persists a per-session count of consecutive compression fallbacks — situations where the LLM compressor fails and the system falls back to the local deletion compressor. `get_compression_fallback_streak(session_id)` reads the current streak (returning 0 for unknown sessions or null values), and `set_compression_fallback_streak(session_id, streak)` writes it back, normalising to a non-negative integer. The streak allows the compressor to make informed decisions about when to stop attempting LLM-based compression and commit to the fallback path.
+
 ### 3.2 Write resilience
 
 Because the DB is shared across processes (gateway workers, CLI sessions, cron runners, desktop readers), writes use:
 
 - **WAL mode** with `DELETE` fallback on NFS/SMB/FUSE filesystems that cannot support WAL (`journal_mode=WAL` raises `OperationalError("locking protocol")`).
-- **Application-level retry with jitter** — `BEGIN IMMEDIATE`, then on `database is locked` sleep a random `20–150 ms` and retry up to 15 times. This breaks the convoy pattern that SQLite’s deterministic internal backoff creates.
+- **Application-level retry with jitter** — `BEGIN IMMEDIATE`, then on `database is locked` sleep a random `20–150 ms` and retry up to 15 times. This breaks the convoy pattern that SQLite's deterministic internal backoff creates.
 - **Periodic TRUNCATE checkpoints** every 50 writes to keep the WAL file from growing without bound.
+- **macOS `synchronous=FULL` enforcement** — after any successful WAL activation, `_enforce_macos_synchronous_full()` sets `PRAGMA synchronous=FULL` on macOS. macOS's `fsync()` does *not* guarantee data-on-platter or write-ordering (per Apple's `fsync(2)` man page), so the WAL default of `synchronous=NORMAL` can leave the main DB with half-written btree pages during a checkpoint race with process termination (e.g. launchd shutdown), resulting in `btreeInitPage error 11` corruption. `synchronous=FULL` issues a real `fsync()` on every transaction commit. The companion `_apply_macos_checkpoint_barrier()` enables `checkpoint_fullfsync=1`, which forces an `F_FULLFSYNC` barrier at checkpoint boundaries (where WAL frames land in the main DB). Both functions are no-ops on non-Darwin platforms and are best-effort (never raise).
 
 Malformed-schema recovery (duplicate `sqlite_master` rows, typically from FTS5 corruption) is handled automatically: `repair_state_db_schema` attempts a `sqlite_master` de-duplication pass, then falls back to dropping and rebuilding the FTS layer while preserving canonical `sessions`/`messages` rows.
 
@@ -197,9 +271,35 @@ When a conversation exceeds the model’s context threshold, the `ContextCompres
 
 A `compression_locks` table prevents two compressors from racing on the same session ID (e.g. parent agent + background-review fork both deciding to compress simultaneously). Locks expire after 5 minutes; a crashed compressor never blocks the session forever.
 
+`get_compression_lineage()` walks the parent→child chain to reconstruct the full compression lineage for a session. It uses `ancestors` and `seen` sets to detect and break cycles in malformed compression parent/child chains, preventing infinite loops. If a parent or child has already been visited (its ID is in the set), the walk terminates rather than looping forever.
+
 ### 3.4 Declarative schema evolution
 
-Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 19`).
+Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 21`).
+
+### 3.5 Workspace grouping (`workspace_key()`)
+
+The top-level `workspace_key(row)` function returns a session's workspace grouping key: its `git_repo_root` when known, else its `cwd`. Branch is deliberately excluded so checking out a new branch doesn't fragment a workspace's session history. Returns `None` for cwd-less (unbound) sessions. Both fields are already recorded on the `sessions` row — this function just picks the coarser identity for grouping and filtering.
+
+### 3.6 Session recovery (`ws_orphan_reap`)
+
+`find_latest_gateway_session_for_peer()` (used by `recover_session_for_session_key()`) treats `end_reason='ws_orphan_reap'` as recoverable alongside `agent_close`. The `ws_orphan_reap` end_reason is set when a dashboard viewer disconnects (before the fix in #60609), which previously left gateway sessions unrecoverable after a viewer disconnect bug. Treating it as recoverable ensures the session can be resumed rather than silently orphaned.
+
+### 3.7 Session import
+
+The `import_sessions(sessions)` method imports sessions exported by `export_session()` or `export_all()`. It enforces bounded batch limits to prevent abuse or accidental overload:
+
+| Limit | Value |
+|---|---|
+| `_IMPORT_MAX_SESSIONS` | 500 |
+| `_IMPORT_MAX_MESSAGES_PER_SESSION` | 10,000 |
+| `_IMPORT_MAX_TOTAL_MESSAGES` | 50,000 |
+| `_IMPORT_MAX_SESSION_BYTES` | 5 MB |
+| `_IMPORT_MAX_TOTAL_BYTES` | 25 MB |
+
+The method validates each session payload (type-checking, JSON serialisability, size limits, duplicate ID detection), normalises text fields, and parses `model_config` as JSON. Existing session IDs are skipped. Imported child sessions keep their `parent_session_id` only when the parent already exists in the database or is included in the same import payload; otherwise the child is detached (parent set to `NULL`) so partial imports don't fail foreign-key validation.
+
+Live runtime state is intentionally reset on import: gateway routing, handoff state, and rewind state are cleared. This restores conversation history, not ownership of a live channel or process. The method returns a summary dict with `ok`, `imported`, `skipped`, `detached`, and `errors` keys.
 
 ---
 
@@ -396,6 +496,7 @@ Certain models have strict server-side contracts. The auxiliary client returns `
 | Curated memory entries (`add`/`replace`/`remove`/`batch`) | `MEMORY.md`, `USER.md` | Tool call | Atomic temp-file + rename; batch is all-or-nothing |
 | Full message history | `state.db` → `messages` | Every turn | Includes tool_calls JSON, reasoning fields |
 | Session metadata (model, tokens, cost, title) | `state.db` → `sessions` | Session start / end / compression | `update_token_counts` increments per API call |
+| Per-model usage attribution | `state.db` → `session_model_usage` | Every API call (incremental) | Per-call deltas keyed by `(session_id, model, provider)`; fixes mid-session `/model` switch attribution |
 | FTS5 index | `messages_fts`, `messages_fts_trigram` | Triggered on INSERT/UPDATE/DELETE | Rebuilt on schema migration |
 | Turn to external provider | Provider backend | End of turn (`sync_all`) | Background ThreadPool; skill scaffolding stripped |
 | Prefetch context for next turn | Provider backend | End of turn (`queue_prefetch`) | Cached, consumed by `prefetch()` on next turn |
@@ -646,6 +747,8 @@ Sessions in Hermes are not monolithic. Three kinds of lineage split the conversa
 
 When a session is **deleted** (e.g. `/delete` or prune), delegate subagent runs are cascade-deleted via the `_delegate_from` marker, while branch children are preserved. Orphaned untagged children (older sessions with no title and ≤25 messages that contain tool rows) are also left alone because they might be subagent runs whose parent was already deleted.
 
+Gateway session recovery via `find_latest_gateway_session_for_peer()` treats `end_reason='agent_close'` and `end_reason='ws_orphan_reap'` as recoverable — sessions ended by these reasons can be resumed rather than orphaned. The `ws_orphan_reap` reason (from dashboard viewer disconnect bugs, fixed in #60609) was previously unrecoverable, leaving gateway sessions silently abandoned after a viewer disconnect.
+
 ---
 
 ## 14. Cron, Gateway, and Non-CLI Memory Behaviour
@@ -683,6 +786,7 @@ The agent is designed so that the external provider, which is by far the slowest
 | Symptom | Likely cause | Automatic recovery |
 |---|---|---|
 | Session DB not available | NFS/SMB filesystem blocking WAL | Falls back to `journal_mode=DELETE`; logs one warning per process |
+| btree corruption on macOS (`btreeInitPage error 11`) | macOS `fsync()` doesn't guarantee durability; WAL checkpoint race with process termination (launchd shutdown) | `_enforce_macos_synchronous_full()` sets `synchronous=FULL`; `_apply_macos_checkpoint_barrier()` enables `checkpoint_fullfsync=1` (F_FULLFSYNC at checkpoint boundaries) |
 | FTS5 module missing | Python built without FTS5 | Disables full-text search; message persistence still works |
 | Malformed schema (duplicate messages_fts) | Crash during FTS5 creation | Auto-repair: de-duplicate `sqlite_master`, or drop FTS and rebuild from messages |
 | Memory file drift | Patch tool / manual edit / concurrent session | Detected at mutation time; backup created; mutation refused with remediation instructions |
@@ -697,7 +801,7 @@ The agent is designed so that the external provider, which is by far the slowest
 | File | Responsibility |
 |---|---|
 | `tools/memory_tool.py` | `MemoryStore`, `memory_tool()` entry point, write-approval gate, threat scanning, drift detection |
-| `hermes_state.py` | `SessionDB`, WAL fallback, schema reconciliation, FTS5 setup, message CRUD, session search primitives, compression locks |
+| `hermes_state.py` | `SessionDB`, `workspace_key()`, WAL fallback, macOS `synchronous=FULL` enforcement, schema reconciliation, FTS5 setup, message CRUD (incl. `effect_disposition`), per-model usage attribution, compression locks, compression lineage cycle detection, session import |
 | `tools/session_search_tool.py` | `session_search()` tool with four shapes (discover, scroll, read, browse), cross-profile resolution |
 | `agent/memory_manager.py` | `MemoryManager`, provider orchestration, background executor, context fencing, tool injection, skill-scaffolding strip |
 | `agent/memory_provider.py` | `MemoryProvider` ABC defining the lifecycle contract for all external backends |

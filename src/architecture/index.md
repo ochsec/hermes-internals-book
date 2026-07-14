@@ -203,7 +203,25 @@ A cross-turn safety mechanism in `agent/chat_completion_helpers.py` detects cons
 
 ## 1.9 Interrupt Handling
 
-Users can interrupt a running turn with Ctrl-C (CLI) or a platform-specific cancel signal. The interrupt propagates via `tools.interrupt.set_interrupt()`, which sets a flag checked between loop iterations. If an interrupt fires while waiting for the LLM, the string `"Operation interrupted: waiting for model response (..."` is emitted and the loop exits cleanly.
+Users can interrupt a running turn with Ctrl-C (CLI) or a platform-specific cancel signal. The interrupt propagates via `tools.interrupt.set_interrupt()`, which sets a flag checked between loop iterations. If an interrupt fires while waiting for the LLM, the string `"Operation interrupted: waiting for model response (...` is emitted and the loop exits cleanly.
+
+When an interrupt fires, the agent also calls `_active_request_abort("interrupt_abort")` if an active HTTP request is in-flight. This cross-thread abort shuts down the active sockets promptly rather than waiting for the API to return. Cron turns, which perform their API request on the conversation thread (to avoid a nested interrupt-worker deadlock), also register their client so the cross-thread interrupt can reach them.
+
+### Persistence Lock
+
+Session persistence (`_commit_session_messages` and `_flush_messages_to_session_db`) now holds a per-agent `_session_persist_lock`. Close and turn-start persistence can run on separate CLI threads; without the lock, both could observe the same unmarked message dict and write duplicate durable rows. The lock is acquired as a critical section covering the scaffolding removal, session message assignment, JSONL save, and SQLite flush.
+
+### Multimodal Content Override
+
+The persistence override logic distinguishes text-only overrides from list overrides. A plain-text override replaces the live message content before the API call only when the content is not multimodal (not a list). A list override, however, is the original clean multimodal payload (e.g., before a queued `/model` note) and must replace the API-local list once the turn is final. This preserves image/audio blocks in the live messages list during the API call while still persisting the clean version.
+
+### Fallback Notice
+
+When a provider/model fallback succeeds, `_emit_pending_fallback_notice()` surfaces a one-shot status notice. The switch is a durable state change operators must see, unlike transient retry chatter that `_clear_status_buffer` drops. The notice is emitted exactly once via `_emit_status` and then cleared. On terminal failure, the buffered switch line is flushed instead (via `_flush_status_buffer`), so the user always sees the switch once.
+
+### Kanban Stop Scaffolding
+
+A `_kanban_stop_synthetic` flag was added to `_EPHEMERAL_SCAFFOLDING_FLAGS`. This prevents kanban worker exit narration (a worker that exits without `kanban_complete`/`block`) from surviving into the real transcript and breaking prompt-prefix cache reuse on later turns.
 
 ## 1.10 Summary Diagram
 

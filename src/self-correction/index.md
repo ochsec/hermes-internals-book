@@ -112,6 +112,18 @@ The guardrails ensure this doesn't loop indefinitely:
 
 This ensures the conversation never dies from context overflow.
 
+### Compression Fallback Streak
+
+`SessionDB` now persists a `compression_fallback_streak` counter per session (`get_compression_fallback_streak()` / `set_compression_fallback_streak()`). This tracks consecutive compression fallbacks — each time the LLM-driven compressor fails and Hermes falls back to the deterministic local deletion compressor, the streak increments. The streak is used by the compaction breaker (below) to detect persistently broken compression and avoid wasting cycles on a model that consistently fails to summarize.
+
+### Fallback Compaction Breaker
+
+A persistent `compaction_breaker` now counts fallback compactions as ineffective. If the LLM compressor repeatedly falls back to the deterministic compressor, the breaker trips and prevents further compression attempts within a cooldown window. The breaker state is persisted on the session row (`compression_failure_cooldown_until`, `compression_failure_error`), so a process restart doesn't reset the cooldown.
+
+### Output-Cap Error Exemption
+
+Parseable output-cap errors from vLLM and LM Studio (e.g., `"This model's maximum output tokens"`) are now exempted from the compression-disabled guard. Previously, an output-cap error would trigger compression, but if compression was disabled, the turn would fail. Now these errors are classified separately — the safe output budget is recalculated from the current input on each output-cap retry, and the retry cap is derived from the provider's `available_out` plus the request estimate rather than a fixed ceiling.
+
 ## 4.6 Fallback Chain
 
 When the primary model fails permanently (quota exhausted, model deprecated, auth revoked), Hermes falls back to the configured `fallback_model`:

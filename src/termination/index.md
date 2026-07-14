@@ -97,7 +97,9 @@ Cron jobs (`cronjob` tool, `hermes cron`) have their own termination conditions:
 - **Non-zero exit / timeout** — Sends an error alert.
 - **Interrupted jobs** — Pre-kill output is suppressed; only post-completion output is delivered to avoid partial/garbled messages.
 - **Interpreter shutdown** — Delivery and dispatch are skipped when the Python interpreter is shutting down to avoid errors during teardown.
-- **Gateway shutdown drain** — In-flight cron jobs are drained before the gateway kills workers, making the shutdown visible to cron work.
+- **Gateway shutdown drain** — In-flight cron jobs are drained before the gateway kills workers, making the shutdown visible to cron work. API-server shutdown also drains in-flight runs.
+- **Live one-shot preservation** — When the running-set check fails (e.g., a stale process lock), live one-shots are kept rather than dropped. This prevents a momentary race from silently discarding a scheduled job.
+- **SessionDB timeout from config** — The `SessionDB` init timeout is resolved from `config.yaml`, and the init is bounded so a hang can't wedge cron forever.
 - **Security** — The scheduler backstop fails closed when the validator errors, and `base_url` overrides that could exfiltrate provider credentials are blocked.
 - **TERMINAL_CWD isolation** — Each job gets an isolated working directory, and the `TERMINAL_CWD` lock is released even when the job body raises an exception.
 
@@ -109,6 +111,14 @@ Delegated subagents terminate when:
 - They hit their iteration budget (`delegation.max_iterations`).
 - The parent is interrupted (cascading cancellation).
 - They throw an unhandled exception (error summary returned to parent).
+
+### Kanban Worker Termination
+
+Kanban workers have additional termination paths:
+
+- **Worker exit without complete/block** — If a worker exits without calling `kanban_complete` or `kanban_block`, the dispatcher nudges the worker to emit a proper terminal status. A `_kanban_stop_synthetic` scaffolding flag prevents the exit narration from surviving into the real transcript.
+- **Protocol violation retry** — The kanban database applies a bounded retry for clean-exit protocol violations (a worker that exits with a zero code but no terminal status update). The retry streak has a defined `max_retries` precedence.
+- **Cron fire reservation** — During gateway drains, cron fire work is reserved so a shutdown doesn't silently drop a scheduled kanban task.
 
 ## 5.9 Summary Diagram
 

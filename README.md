@@ -25,4 +25,4 @@ This book covers only the **agent loop system** — how Hermes thinks, acts, del
 ## Source Reference
 
 All descriptions are derived from the Hermes Agent source code at
-`/home/h/github/hermes-agent-nous-research/` (commit `56a8e81d33a5`, 2026-07-08).
+`/home/h/github/hermes-agent-nous-research/` (commit `2a0dd95cc`, 2026-07-14).

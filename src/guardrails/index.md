@@ -12,7 +12,7 @@ The prompt builder (`agent/prompt_builder.py`) constructs a guardrails block tha
 - **Destructive command caution** — "Always confirm before `rm -rf`, `git reset --hard`, or similar irreversible operations."
 - **Secret hygiene** — "Scan output for API keys, tokens, and passwords before returning results to the user."
 - **File safety** — "Never overwrite user files without checking content first."
-- **Approval mode** — "Respect the user's approval settings (`manual`, `smart`, or `off`)."
+- **Approval mode** — "Respect the user's approval settings (`smart`, `manual`, or `off`)."
 
 These instructions are **advisory only** — they rely on the model's ability to follow instructions. Stronger models (Claude, GPT-4, Gemini) are more reliable at self-policing; weaker models may ignore them.
 
@@ -104,11 +104,13 @@ Before any tool that could damage the system runs, Hermes checks whether it need
 
 Set via `approvals.mode` in `config.yaml`:
 
-- **`manual`** — Always prompt before destructive commands (default).
-- **`smart`** — An auxiliary LLM auto-approves low-risk commands, prompts on high-risk.
+- **`smart`** — An auxiliary LLM auto-approves low-risk commands, denies high-risk commands, and prompts when uncertain (default).
+- **`manual`** — Always prompt before destructive commands.
 - **`off`** — Skip all approval prompts (equivalent to `--yolo` flag).
 
 Per-invocation bypass without changing config: `hermes --yolo` or `export HERMES_YOLO_MODE=1`.
+
+The approval timeout is standardized via `_get_approval_timeout()`, which defaults to 60 seconds. This applies to all approval paths, including gateway-based approval prompts (previously 300 seconds).
 
 ### What Counts as "Destructive"
 
@@ -123,15 +125,32 @@ Per-invocation bypass without changing config: `hermes --yolo` or `export HERMES
 
 File-mutating tools (`write_file`, `patch`) on existing files also trigger approval unless the file was created in the current turn.
 
+**Verification artifact cleanup exemption**: `detect_dangerous_command()` checks `_is_verification_artifact_cleanup()` before applying pattern matching. Commands that match `rm -f /tmp/hermes-verify-*` or `rm -f /tmp/hermes-ad-hoc-*` are exempted from dangerous-pattern detection, since these are known-safe cleanup operations for ephemeral verification artifacts.
+
 ### Smart Approval
 
-In `smart` mode, a lightweight LLM call evaluates the command string against a rubric:
+In `smart` mode (the default), a lightweight LLM call evaluates the command string against a rubric:
 
 - Does the command target a file in the current project directory?
 - Is the command reversible (git-tracked, backup exists)?
 - Does the command pattern match known-safe operations?
 
-If the auxiliary model returns "safe", the command executes without interruption. If "uncertain", the user is prompted. This adds ~200–500 ms latency to approved commands.
+The verdict drives one of three outcomes:
+
+- **ALLOW** — Low-risk commands are auto-approved. The approval is scoped to a single operation (not session-level), so the same command will be re-evaluated next time.
+- **DENY** — High-risk commands are denied. For interactive owners (`is_cli`, `is_gateway`, `is_ask`), the DENY includes a one-operation override prompt, allowing the user to proceed despite the negative verdict. This override is scoped to the current operation only — there is no permanent or session-level persistence. For non-interactive paths (automated pipelines, subagents), a DENY is hard-blocked with no override.
+- **PROMPT** — When the auxiliary model is uncertain, the user is prompted as in `manual` mode.
+
+This adds ~200–500 ms latency to approved commands.
+
+#### Smart Approval Observer Hooks
+
+Two functions provide hook emission for smart verdicts:
+
+- `_prepare_smart_approval_observer()` — emits a pre-approval hook with the command context.
+- `_observe_smart_approval_verdict()` — emits a post-approval hook with the verdict and outcome.
+
+Both functions redact the command string and description before emitting to the observer, preventing sensitive command details from leaking into hook payloads.
 
 ## 2.4 Secret Redaction
 
@@ -155,6 +174,10 @@ If the auxiliary model returns "safe", the command executes without interruption
 - **Backup on overwrite** — Existing files are backed up to `~/.hermes/backups/` before mutation.
 - **Symlink traversal guard** — Prevents writing through symlinks that escape the intended directory.
 - **Critical path denylist** — Refuses to write to `/etc/`, `/usr/`, `/bin/`, and other system directories unless running as root (and even then, warns).
+
+### Skill Security Scanning
+
+`agent/skills_guard.py` provides security scanning of skill content before execution. Scan results are cached via `scan_skill_cached()`, which uses `full_content_hash()` — a SHA-256 digest over relative file paths and exact file bytes — to produce an attestation-bound cache key. A `SCANNER_VERSION` constant is included in the cache key, ensuring that any update to the scanner logic invalidates stale cache entries. The `ScanResult` dataclass carries a `scan_provenance` field recording the scanner version and content hash used, so cached results are verifiably bound to the exact content and scanner version that produced them.
 
 ## 2.6 Message Sanitization
 
@@ -209,9 +232,10 @@ Each classification drives a different recovery strategy in `conversation_loop.p
 |-------|-----------|-------------|----------|
 | Prompt norms | System prompt instructions | LLM compliance | `--yolo` (weakens instructions) |
 | Tool loop guardrails | Exact/same-tool/no-progress counters | `ToolCallGuardrailController` | `hard_stop_enabled: false` |
-| Destructive approval | Human or auxiliary LLM | `tool_dispatch_helpers.py` | `approvals.mode: off` or `--yolo` |
+| Destructive approval | Human or auxiliary LLM | `tool_dispatch_helpers.py` | `approvals.mode: off` or `--yolo` (default: `smart`) |
 | Secret redaction | Regex masking | `agent/redact.py` | `security.redact_secrets: false` |
 | File safety | Atomic writes, backups, path guards, credential-path blocking | `agent/file_safety.py` | none (always active) |
+| Skill scanning | Attestation-bound cache, pattern matching | `agent/skills_guard.py` | `SCANNER_VERSION` invalidation |
 | Message sanitization | Surrogate/control-char removal | `agent/message_sanitization.py` | none (always active) |
 | SSL validation | Certificate pinning, fail-fast on verification failure | `agent/ssl_guard.py` | `ssl.verify: false` |
 | Error classification | 23 `FailoverReason` values driving recovery | `agent/error_classifier.py` | per-error retry/fallback config |
@@ -225,7 +249,7 @@ Each classification drives a different recovery strategy in `conversation_loop.p
           │
           ▼
 ┌─────────────────────────────┐
-│  _is_destructive_command()? │──YES──▶ User Approval (or smart bypass)
+│  _is_destructive_command()? │──YES──▶ Smart Approval (default) or User Prompt
 └─────────────────────────────┘
           │ NO
           ▼

@@ -41,6 +41,8 @@ delegate_task(tasks=[
 4. **Summary returned** — The child returns a condensed summary (not the full conversation). The parent receives this summary as a tool result.
 5. **Parent resumes** — The parent sees the summary in its next loop iteration and continues.
 
+When delegations are dispatched asynchronously (via the daemon pool in `tools/async_delegation.py`), the lifecycle extends with a **`finalizing`** transitional state. After the child agent completes but before the result is persisted to SQLite and published to the completion queue, the record's status flips to `finalizing` rather than directly to `completed` or `failed`. This prevents process shutdown from killing a daemon worker in the narrow gap after the status flips but before the SQLite commit lands. `active_count()` counts both `running` and `finalizing` records, so the pool does not reclaim capacity prematurely. Only after the completion event is persisted and enqueued does the record transition to its terminal state (`completed`, `failed`, `unknown`) and become eligible for in-memory pruning.
+
 ### Security: No Model-Controlled ACP Transport
 
 The delegate ACP (Agent Context Protocol) transport was removed from model control. The model cannot choose to spawn subagents via ACP — delegation is always handled through the internal `delegate_task` tool path, preventing a compromised model from exfiltrating context through an ACP channel.
@@ -69,6 +71,83 @@ delegation:
   max_concurrent_children: 3    # Parallel batch limit
   reasoning_effort: "medium"
 ```
+
+### Child Agent Provider Overrides
+
+`_build_child_agent` accepts `override_request_overrides` and `override_max_tokens` parameters that control how the child agent's provider configuration diverges from the parent's:
+
+- **`override_request_overrides`** — When a provider is overridden, the child receives a fresh `request_overrides` dict (from `_resolve_delegation_credentials`) rather than inheriting the parent's. When no override is in effect, the child inherits the parent's `request_overrides` as-is. This ensures that provider-specific request parameters (extra headers, body fields, etc.) are correct for the delegated provider, not leaked from the parent's.
+- **`override_max_tokens`** — Sets the child's `max_tokens` independently of the parent. Falls back to the parent's `max_tokens` when not specified.
+
+The child also inherits two provider-gating attributes from the parent: `provider_require_parameters` (default `False`) and `provider_data_collection` (default `""`). When a provider override is in effect, both are reset to their defaults (`False` / `""`) since the overridden provider's gating policy should apply independently.
+
+### 3.2.1 Durable Delegation Persistence
+
+Async delegations dispatched through the daemon pool are persisted to an `async_delegations` table in `state.db` (the same SQLite database used by kanban and session state). This durability layer ensures that completions survive process crashes and that competing gateway processes do not double-deliver results.
+
+#### Schema
+
+The `async_delegations` table stores the full lifecycle of each delegation:
+
+| Column | Purpose |
+|--------|---------|
+| `delegation_id` | Primary key (UUID) |
+| `origin_session` | Session key that originated the delegation |
+| `origin_ui_session_id` | UI session identifier |
+| `parent_session_id` | Parent's session ID for context |
+| `state` | `running` → `finalizing` → `completed` / `failed` / `unknown` |
+| `dispatched_at` | Epoch timestamp when the delegation was dispatched |
+| `completed_at` | Epoch timestamp when the child agent finished |
+| `updated_at` | Last modification time (used for retention pruning) |
+| `event_json` | Serialized completion event (goal, summary, error, status) |
+| `result_json` | Serialized result dict |
+| `delivery_state` | `pending` or `delivered` |
+| `delivery_attempts` | Count of delivery attempts (incremented on each claim) |
+| `delivered_at` | Timestamp of successful delivery |
+| `owner_pid` | PID of the process that dispatched the delegation |
+| `owner_started_at` | Process start time (for crash detection) |
+| `task_json` | Serialized task payload (goal, context, model, role, etc.) |
+| `delivery_claim` | Current delivery claim token |
+| `delivery_claimed_at` | Timestamp when the current claim was made |
+
+The database connection uses WAL journal mode (`PRAGMA journal_mode=WAL`) for concurrent read/write compatibility. A module-level `_DB_LOCK` serializes writes within the process. The schema is created lazily via `CREATE TABLE IF NOT EXISTS`, with `ALTER TABLE ADD COLUMN` migrations for columns added after initial deployment.
+
+#### Dispatch Persistence
+
+When a delegation is dispatched (`_persist_dispatch`), a row is inserted with `state='running'`, `delivery_state='pending'`, the owning process's PID and start time, and a serialized task payload. If the thread pool rejects the submission, the durable row is deleted (`_delete_durable_delegation`) so it does not linger as an orphan.
+
+#### Completion Persistence
+
+When the child agent finishes, `_persist_completion` updates the row with the completion event and result JSON, sets `completed_at`, and resets `delivery_state` to `pending` so the completion can be delivered to the origin session. This happens during the `finalizing` window — the in-memory record stays in `finalizing` status until after this SQLite commit, preventing a race where process shutdown kills the worker between the status flip and the commit.
+
+#### Abandoned Delegation Recovery
+
+`recover_abandoned_delegations()` runs at process startup and whenever completions are restored. It scans for records in `running` or `finalizing` state whose owning process has disappeared — determined by checking whether `owner_pid` still exists and whether its current start time matches `owner_started_at`. Records whose owner is gone are marked `state='unknown'` with a synthetic completion event (`status: "unknown"`, `error: "Delegation owner exited before recording a terminal result; outcome unknown."`) and `delivery_state='pending'`, so the parent session is at least notified that the delegation's outcome is indeterminate rather than silently lost.
+
+#### Delivery Claiming
+
+When multiple gateway processes may compete to deliver the same completion, a claim-based protocol prevents duplicate delivery:
+
+- `claim_completion_delivery(delegation_id, claim_id)` — Atomically claims a pending completion. A claim succeeds only if `delivery_state='pending'` and no active claim exists (or the previous claim is older than 5 minutes, treating it as stale). Returns `True` if the claim was acquired.
+- `complete_completion_delivery(delegation_id, claim_id)` — Marks the completion as `delivered` and clears the claim. Only the consumer holding the matching `claim_id` can finalize delivery.
+- `release_completion_delivery(delegation_id, claim_id)` — Releases a failed delivery claim so another consumer may retry. Clears the claim if it matches and the delivery is still pending.
+- `mark_completion_delivered(delegation_id)` — Simpler unconditional acknowledge for paths that do not need claim-based competition.
+
+The event consumer path wraps these: `claim_event_delivery(evt, consumer)` generates a claim ID (`{consumer}:{pid}:{uuid}`) and calls `claim_completion_delivery`, returning the claim ID on success or `None` if the claim could not be acquired (or `""` for non-durable events that need no token). `complete_event_delivery(evt, claim_id)` and `release_event_delivery(evt, claim_id)` delegate to the corresponding SQLite operations. Legacy events created before durable dispatch are handled gracefully — if no row exists for the `delegation_id`, the claim is treated as successful so the event proceeds without blocking.
+
+#### Undelivered Completion Restoration
+
+`restore_undelivered_completions(target_queue)` is called at process startup to re-enqueue durable pending completions as fresh turns. It first calls `recover_abandoned_delegations()` to classify orphaned records, then selects all records where `state != 'running'` and `delivery_state='pending'` with a non-null `event_json`, ordered by `completed_at` then `delegation_id`, and puts each event onto the target queue. This ensures that completions produced by a previous process incarnation — but never delivered because the process crashed — are replayed after restart.
+
+#### Retention Bounds
+
+Two constants bound the growth of the durable table:
+
+- `_DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60` (7 days) — Records older than this with `delivery_state='delivered'` are deleted.
+- `_MAX_DURABLE_PENDING = 1000` — Maximum number of terminal records with `delivery_state='pending'`. Excess pending records are pruned oldest-first.
+
+`_prune_durable_records()` runs after each dispatch. It first deletes delivered records past the retention window, then trims terminal records (those not in `running` or `finalizing`) to `_MAX_RETAINED_COMPLETED` (50), preferring delivered records for deletion (they sort first in the `ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END` clause). Finally, if pending terminal records exceed `_MAX_DURABLE_PENDING`, the oldest are removed.
+
 
 ## 3.3 Asynchronous Process Spawning
 

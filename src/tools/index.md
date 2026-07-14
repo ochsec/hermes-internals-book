@@ -141,6 +141,8 @@ def _module_registers_tools(module_path: Path) -> bool:
 
 Only modules whose top-level statements contain a `registry.register(...)` expression are imported. Helper modules that happen to call `register()` inside a function are ignored. This keeps discovery fast and predictable. Imported modules execute their registration calls as a side effect of `importlib.import_module()`.
 
+A cheap **text prefilter** was added to `_module_registers_tools()`: before paying the `ast.parse` cost, the source is checked for the substrings `"registry"` and `"register"`. If either is absent, the file is skipped without parsing. This is a necessary condition for a top-level `registry.register()` call to exist, and it avoids the AST parse cost for files that don't mention either token.
+
 After built-in discovery, `model_tools.py` also triggers **plugin discovery** (`hermes_cli.plugins.discover_plugins()`) and, at the discretion of each entry point, **MCP discovery** (`tools.mcp_tool.discover_mcp_tools()`). MCP discovery used to be a module-level side effect, but it was moved to explicit entry-point startup because it blocks for up to 120 seconds — too long for a gateway heartbeat loop.
 
 ### 2.4 Availability Checking and Caching
@@ -311,6 +313,7 @@ The search backend is a simple in-memory BM25 index over tokenized tool names, d
 `ToolRegistry.dispatch()` looks up the `ToolEntry` by name, then:
 
 - If `entry.is_async`, bridges the coroutine through `_run_async()`, which manages a persistent event loop so cached `httpx`/`AsyncOpenAI` clients don't hit "Event loop is closed" on garbage collection.
+- Normalizes the handler result via `_normalize_handler_result()`. Normal tool results are strings. The sole structured exception is the multimodal envelope (a dict with `_multimodal=True` and a `content` list) consumed by the agent executor. Every other non-string return type is converted to a JSON error string (`{"error": "Tool handler returned unsupported result type: ...", "error_type": "tool_result_contract"}`) so that logging, hooks, budgeting, and persistence never receive values they cannot safely slice or size.
 - Catches all exceptions, sanitizes them via `_sanitize_tool_error()` (stripping XML tags, markdown fences, CDATA, and capping at 2000 chars), and returns `{"error": "..."}`.
 
 The dispatcher is intentionally thin. The heavy lifting (argument validation, env setup, result formatting) lives in each tool's handler.
