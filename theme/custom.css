@@ -1,120 +1,39 @@
 /* Hermes Agent Internals — mdBook theme override
- * Matches the Hermes docs-site branding (amber-on-dark, terminal aesthetic):
- * colors from hermes-agent.nousresearch.com (website/src/css/custom.css).
- * Dark is the primary mode (default theme: coal); light mode gets the
- * site's dark-amber-on-white palette.
+ * Modeled on nousresearch.com (the "hermes-portal-v2" design system):
+ * ink-on-paper light theme with the signature Nous blue, extracted from
+ * the site's shipped CSS:
+ *   surface/stage/panel #fdfdfd, panel-muted #f4f4f4, row-well #efefef,
+ *   ink #1a1a1a, muted #4a4a4a, hairline #8a8a8a,
+ *   primary (Nous blue) #0000f2, accent yellow #f2f200,
+ *   dark surface = blue-dark-80 (near-black navy over #000).
+ * Headings use Oswald (the site's own --font-display fallback), body uses
+ * the system sans stack, code uses JetBrains Mono (the site's font-mono).
  */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ─── Fonts ──────────────────────────────────────────────────────────── */
-
-html {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-}
-
-:root,
-.coal {
-    --mono-font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-}
-
-/* ─── Light mode: site's dark-amber-on-white palette ────────────────── */
+/* ─── Type ───────────────────────────────────────────────────────────── */
 
 :root,
 .light {
-    --links: #7a5800;
-    --sidebar-active: #8b6508;
-    --sidebar-fg: #3d3d3d;
-    --table-header-bg: rgba(139, 101, 8, 0.06);
-    --table-border-color: rgba(139, 101, 8, 0.15);
-    --table-alternate-bg: rgba(139, 101, 8, 0.03);
-    --quote-border: rgba(139, 101, 8, 0.35);
-    --search-mark-bg: rgba(139, 101, 8, 0.18);
-    --footnote-highlight: #7a5800;
+    --mono-font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
 }
 
-.content a:hover,
-.nav-chapters:hover,
-.sidebar .chapter a:hover {
-    color: #5a4100;
+html {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+        'Helvetica Neue', Arial, sans-serif;
 }
 
-/* ─── Dark mode (primary): the landing-page palette ─────────────────── */
-
-.coal {
-    --bg: #07070d;
-    --fg: #e8e4dc;
-
-    --sidebar-bg: #0a0a12;
-    --sidebar-fg: #9a968e;
-    --sidebar-non-existant: #4a473c;
-    --sidebar-active: #ffd700;
-    --sidebar-spacer: rgba(255, 215, 0, 0.08);
-
-    --scrollbar: #1a1a30;
-
-    --icons: #5a5648;
-    --icons-hover: #ffd700;
-
-    --links: #ffd700;
-
-    --inline-code-color: #ffdd33;
-
-    --theme-popup-bg: #0f0f18;
-    --theme-popup-border: rgba(255, 215, 0, 0.15);
-    --theme-hover: #1a1a30;
-
-    --quote-bg: #0f0f18;
-    --quote-border: rgba(255, 215, 0, 0.15);
-
-    --table-border-color: rgba(255, 215, 0, 0.06);
-    --table-header-bg: rgba(255, 215, 0, 0.06);
-    --table-alternate-bg: rgba(255, 215, 0, 0.02);
-
-    --searchbar-bg: #0f0f18;
-    --searchbar-fg: #e8e4dc;
-    --searchbar-border-color: rgba(255, 215, 0, 0.12);
-    --searchbar-shadow-color: rgba(0, 0, 0, 0.6);
-    --searchresults-header-fg: #9a968e;
-    --searchresults-border-color: rgba(255, 215, 0, 0.08);
-    --searchresults-li-bg: #1a1a30;
-    --search-mark-bg: rgba(255, 215, 0, 0.25);
-
-    --copy-button-filter: invert(60%) sepia(8%) saturate(320%) hue-rotate(5deg) brightness(95%) contrast(90%);
-    --copy-button-filter-hover: invert(84%) sepia(72%) saturate(1200%) hue-rotate(355deg) brightness(103%) contrast(96%);
-
-    --footnote-highlight: #ffd700;
-    --overlay-bg: rgba(7, 7, 13, 0.6);
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Oswald', 'Arial Narrow', sans-serif;
+    font-weight: 500;
+    letter-spacing: 0.01em;
 }
 
-/* Subtle dot grid backdrop, matching the landing page */
-.coal body,
-body.coal {
-    background-image: radial-gradient(rgba(255, 215, 0, 0.02) 1px, transparent 1px);
-    background-size: 32px 32px;
-}
-
-/* Active sidebar entry: gold hairline + tint, like the docs-site menu */
-.sidebar .chapter a.active {
-    color: var(--sidebar-active);
-    background-color: rgba(255, 215, 0, 0.08);
-    box-shadow: inset 3px 0 0 0 #ffd700;
-}
-
-/* Link hover */
-.coal .content a:hover {
-    color: #ffbf00;
-}
-
-/* Inline code */
-.coal code {
-    background-color: #0f0f18;
-}
-
-/* Fenced code blocks: terminal surface + gold hairline */
-.coal pre {
-    background-color: #0a0a12;
-    border: 1px solid rgba(255, 215, 0, 0.06);
+/* Editorial serif for blockquotes, like the site's pull-quote style */
+blockquote {
+    font-family: 'EB Garamond', Georgia, serif;
+    font-size: 1.05em;
 }
 
 /* Box-drawing-safe monospace for ASCII diagrams */
@@ -124,47 +43,199 @@ pre {
     font-feature-settings: 'liga' 0, 'calt' 0;
 }
 
-/* Tables */
+/* ─── Light mode (primary): ink-on-paper ─────────────────────────────── */
+
+:root,
+.light {
+    --bg: #fdfdfd;
+    --fg: #1a1a1a;
+
+    --sidebar-bg: #f4f4f4;
+    --sidebar-fg: #4a4a4a;
+    --sidebar-non-existant: #b8b8b8;
+    --sidebar-active: #0000f2;
+    --sidebar-spacer: #e3e3e3;
+
+    --scrollbar: #d4d4d4;
+
+    --icons: #8a8a8a;
+    --icons-hover: #0000f2;
+
+    --links: #0000f2;
+
+    --inline-code-color: #1a1a1a;
+
+    --theme-popup-bg: #fdfdfd;
+    --theme-popup-border: #d4d4d4;
+    --theme-hover: #efefef;
+
+    --quote-bg: #f4f4f4;
+    --quote-border: #8a8a8a;
+
+    --warning-border: #f27900;
+
+    --table-border-color: #e3e3e3;
+    --table-header-bg: #f4f4f4;
+    --table-alternate-bg: #f7f7f7;
+
+    --searchbar-bg: #f4f4f4;
+    --searchbar-fg: #1a1a1a;
+    --searchbar-border-color: #d4d4d4;
+    --searchbar-shadow-color: rgba(26, 26, 26, 0.08);
+    --searchresults-header-fg: #4a4a4a;
+    --searchresults-border-color: #e3e3e3;
+    --searchresults-li-bg: #efefef;
+    --search-mark-bg: #f2f200;
+
+    --copy-button-filter: invert(27%) sepia(0%) saturate(0%) brightness(91%);
+    --copy-button-filter-hover: invert(12%) sepia(96%) saturate(5000%) hue-rotate(235deg) brightness(96%);
+
+    --footnote-highlight: #0000f2;
+    --overlay-bg: rgba(26, 26, 26, 0.4);
+
+    --color-scheme: light;
+}
+
+.light .content a:hover,
+.light .nav-chapters:hover,
+.light .sidebar .chapter a:hover {
+    color: #000091;
+}
+
+.light code {
+    background-color: #efefef;
+}
+
+.light pre {
+    background-color: #f4f4f4;
+    border: 1px solid #e3e3e3;
+}
+
+.light table th {
+    border-color: #d4d4d4;
+}
+
+.light table td {
+    border-color: #e3e3e3;
+}
+
+/* Active sidebar entry: Nous blue, like the site's nav */
+.sidebar .chapter a.active {
+    color: var(--sidebar-active);
+    background-color: rgba(0, 0, 242, 0.06);
+    box-shadow: inset 3px 0 0 0 #0000f2;
+}
+
+.light h1,
+.light h2,
+.light h3,
+.light h4,
+.light h5,
+.light h6 {
+    color: #1a1a1a;
+}
+
+/* ─── Dark mode: near-black navy (blue-dark-80 over #000) ────────────── */
+
+.coal {
+    --bg: #030314;
+    --fg: #f2f2f2;
+
+    --sidebar-bg: #0a0a1e;
+    --sidebar-fg: #b8b8c4;
+    --sidebar-non-existant: #3a3a52;
+    --sidebar-active: #7d7dff;
+    --sidebar-spacer: rgba(255, 255, 255, 0.08);
+
+    --scrollbar: #1e1e3a;
+
+    --icons: #5a5a74;
+    --icons-hover: #7d7dff;
+
+    --links: #7d7dff;
+
+    --inline-code-color: #f2f2f2;
+
+    --theme-popup-bg: #0a0a1e;
+    --theme-popup-border: rgba(255, 255, 255, 0.15);
+    --theme-hover: #14142e;
+
+    --quote-bg: #0a0a1e;
+    --quote-border: rgba(255, 255, 255, 0.15);
+
+    --table-border-color: rgba(255, 255, 255, 0.08);
+    --table-header-bg: rgba(255, 255, 255, 0.06);
+    --table-alternate-bg: rgba(255, 255, 255, 0.02);
+
+    --searchbar-bg: #0a0a1e;
+    --searchbar-fg: #f2f2f2;
+    --searchbar-border-color: rgba(255, 255, 255, 0.15);
+    --searchbar-shadow-color: rgba(0, 0, 0, 0.6);
+    --searchresults-header-fg: #b8b8c4;
+    --searchresults-border-color: rgba(255, 255, 255, 0.08);
+    --searchresults-li-bg: #14142e;
+    --search-mark-bg: #f2f200;
+
+    --copy-button-filter: invert(60%) sepia(8%) saturate(320%) hue-rotate(230deg) brightness(95%) contrast(90%);
+    --copy-button-filter-hover: invert(60%) sepia(90%) saturate(2000%) hue-rotate(225deg) brightness(103%) contrast(95%);
+
+    --footnote-highlight: #7d7dff;
+    --overlay-bg: rgba(3, 3, 20, 0.6);
+
+    --color-scheme: dark;
+}
+
+.coal .content a:hover,
+.coal .nav-chapters:hover,
+.coal .sidebar .chapter a:hover {
+    color: #a3a3ff;
+}
+
+.coal code {
+    background-color: #0a0a1e;
+}
+
+.coal pre {
+    background-color: #0a0a1e;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 .coal table th {
-    border-color: rgba(255, 215, 0, 0.12);
+    border-color: rgba(255, 255, 255, 0.14);
 }
 
 .coal table td {
-    border-color: rgba(255, 215, 0, 0.06);
+    border-color: rgba(255, 255, 255, 0.08);
 }
 
-/* Scrollbar, matching the docs site */
 .coal ::-webkit-scrollbar {
     width: 8px;
     height: 8px;
 }
 
 .coal ::-webkit-scrollbar-track {
-    background: #07070d;
+    background: #030314;
 }
 
 .coal ::-webkit-scrollbar-thumb {
-    background: #1a1a30;
+    background: #1e1e3a;
     border-radius: 4px;
 }
 
 .coal ::-webkit-scrollbar-thumb:hover {
-    background: #2a2a40;
+    background: #2c2c52;
 }
 
-/* Searchbar on dark */
-.coal .searchbar {
-    border: 1px solid rgba(255, 215, 0, 0.08);
-}
-
-/* Headings slightly warmer */
 .coal h1,
 .coal h2,
 .coal h3,
 .coal h4,
 .coal h5,
 .coal h6 {
-    color: #f4efe2;
-    font-weight: 600;
-    letter-spacing: -0.01em;
+    color: #fdfdfd;
+}
+
+/* Yellow search highlight needs dark text in dark mode for legibility */
+.coal .search-results mark {
+    color: #1a1a1a;
 }
