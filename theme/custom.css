@@ -1,0 +1,170 @@
+/* Hermes Agent Internals — mdBook theme override
+ * Matches the Hermes docs-site branding (amber-on-dark, terminal aesthetic):
+ * colors from hermes-agent.nousresearch.com (website/src/css/custom.css).
+ * Dark is the primary mode (default theme: coal); light mode gets the
+ * site's dark-amber-on-white palette.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ─── Fonts ──────────────────────────────────────────────────────────── */
+
+html {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+:root,
+.coal {
+    --mono-font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+/* ─── Light mode: site's dark-amber-on-white palette ────────────────── */
+
+:root,
+.light {
+    --links: #7a5800;
+    --sidebar-active: #8b6508;
+    --sidebar-fg: #3d3d3d;
+    --table-header-bg: rgba(139, 101, 8, 0.06);
+    --table-border-color: rgba(139, 101, 8, 0.15);
+    --table-alternate-bg: rgba(139, 101, 8, 0.03);
+    --quote-border: rgba(139, 101, 8, 0.35);
+    --search-mark-bg: rgba(139, 101, 8, 0.18);
+    --footnote-highlight: #7a5800;
+}
+
+.content a:hover,
+.nav-chapters:hover,
+.sidebar .chapter a:hover {
+    color: #5a4100;
+}
+
+/* ─── Dark mode (primary): the landing-page palette ─────────────────── */
+
+.coal {
+    --bg: #07070d;
+    --fg: #e8e4dc;
+
+    --sidebar-bg: #0a0a12;
+    --sidebar-fg: #9a968e;
+    --sidebar-non-existant: #4a473c;
+    --sidebar-active: #ffd700;
+    --sidebar-spacer: rgba(255, 215, 0, 0.08);
+
+    --scrollbar: #1a1a30;
+
+    --icons: #5a5648;
+    --icons-hover: #ffd700;
+
+    --links: #ffd700;
+
+    --inline-code-color: #ffdd33;
+
+    --theme-popup-bg: #0f0f18;
+    --theme-popup-border: rgba(255, 215, 0, 0.15);
+    --theme-hover: #1a1a30;
+
+    --quote-bg: #0f0f18;
+    --quote-border: rgba(255, 215, 0, 0.15);
+
+    --table-border-color: rgba(255, 215, 0, 0.06);
+    --table-header-bg: rgba(255, 215, 0, 0.06);
+    --table-alternate-bg: rgba(255, 215, 0, 0.02);
+
+    --searchbar-bg: #0f0f18;
+    --searchbar-fg: #e8e4dc;
+    --searchbar-border-color: rgba(255, 215, 0, 0.12);
+    --searchbar-shadow-color: rgba(0, 0, 0, 0.6);
+    --searchresults-header-fg: #9a968e;
+    --searchresults-border-color: rgba(255, 215, 0, 0.08);
+    --searchresults-li-bg: #1a1a30;
+    --search-mark-bg: rgba(255, 215, 0, 0.25);
+
+    --copy-button-filter: invert(60%) sepia(8%) saturate(320%) hue-rotate(5deg) brightness(95%) contrast(90%);
+    --copy-button-filter-hover: invert(84%) sepia(72%) saturate(1200%) hue-rotate(355deg) brightness(103%) contrast(96%);
+
+    --footnote-highlight: #ffd700;
+    --overlay-bg: rgba(7, 7, 13, 0.6);
+}
+
+/* Subtle dot grid backdrop, matching the landing page */
+.coal body,
+body.coal {
+    background-image: radial-gradient(rgba(255, 215, 0, 0.02) 1px, transparent 1px);
+    background-size: 32px 32px;
+}
+
+/* Active sidebar entry: gold hairline + tint, like the docs-site menu */
+.sidebar .chapter a.active {
+    color: var(--sidebar-active);
+    background-color: rgba(255, 215, 0, 0.08);
+    box-shadow: inset 3px 0 0 0 #ffd700;
+}
+
+/* Link hover */
+.coal .content a:hover {
+    color: #ffbf00;
+}
+
+/* Inline code */
+.coal code {
+    background-color: #0f0f18;
+}
+
+/* Fenced code blocks: terminal surface + gold hairline */
+.coal pre {
+    background-color: #0a0a12;
+    border: 1px solid rgba(255, 215, 0, 0.06);
+}
+
+/* Box-drawing-safe monospace for ASCII diagrams */
+pre code,
+pre {
+    font-variant-ligatures: none;
+    font-feature-settings: 'liga' 0, 'calt' 0;
+}
+
+/* Tables */
+.coal table th {
+    border-color: rgba(255, 215, 0, 0.12);
+}
+
+.coal table td {
+    border-color: rgba(255, 215, 0, 0.06);
+}
+
+/* Scrollbar, matching the docs site */
+.coal ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.coal ::-webkit-scrollbar-track {
+    background: #07070d;
+}
+
+.coal ::-webkit-scrollbar-thumb {
+    background: #1a1a30;
+    border-radius: 4px;
+}
+
+.coal ::-webkit-scrollbar-thumb:hover {
+    background: #2a2a40;
+}
+
+/* Searchbar on dark */
+.coal .searchbar {
+    border: 1px solid rgba(255, 215, 0, 0.08);
+}
+
+/* Headings slightly warmer */
+.coal h1,
+.coal h2,
+.coal h3,
+.coal h4,
+.coal h5,
+.coal h6 {
+    color: #f4efe2;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}

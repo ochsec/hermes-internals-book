@@ -9,6 +9,9 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
+default-theme = "coal"
+preferred-dark-theme = "coal"
+additional-css = ["theme/custom.css"]
 git-repository-url = "https://github.com/ochsec/hermes-internals-book"
-edit-url-template = "https://github.com/ochsec/book/edit/main/{path}"
+edit-url-template = "https://github.com/ochsec/hermes-internals-book/edit/main/{path}"
 site-url = "/hermes-internals-book/"
