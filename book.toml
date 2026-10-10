@@ -3,7 +3,6 @@ title = "Hermes Agent Internals"
 authors = ["ochsec"]
 description = "A technical reference documenting the internal workings of the Hermes Agent framework."
 src = "."
-multilingual = false
 
 [build]
 build-dir = "book"
