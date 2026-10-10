@@ -2,6 +2,8 @@
 
 Hermes remembers in three layers: a fast, curated, file-backed **core memory** that rides in the system prompt; a durable **session store** indexed by SQLite FTS5 that the agent can search at zero LLM cost; and an optional **pluggable external memory backend** that trades speed for cross-service persistence. All three are coordinated by a single orchestrator, the `MemoryManager`, so that the agent never pays for more than one memory tax per turn.
 
+> A note on the source layout: as the session store grew, `hermes_state.py` was decomposed into a facade plus roughly thirty topic modules (`hermes_state_schema.py`, `hermes_state_wal.py`, `hermes_state_readpool.py`, `hermes_state_compression.py`, `hermes_state_sessions.py`, …). `SessionDB` is still the single class agents see — the facade re-assembles it from mixins — but a given behaviour now lives in its own module. This chapter names the owning module where it matters.
+
 > Design principle: *per-conversation prompt caching is sacred.*  Any component that mutates past context, swaps toolsets, or rebuilds the system prompt mid-conversation invalidates the cache and multiplies the user's cost. The memory system therefore **freezes the system-prompt snapshot for the entire session**; mid-session writes land on disk (and in external backends) but do not touch the prompt prefix.
 
 ---
@@ -13,7 +15,7 @@ Hermes remembers in three layers: a fast, curated, file-backed **core memory** t
 │                              AIAgent (run_agent.py)                         │
 │  ┌─────────────────────┐  ┌──────────────────┐  ┌────────────────────────┐ │
 │  │   MemoryStore       │  │   SessionDB      │  │   MemoryManager        │ │
-│  │  (tools/memory_tool)│  │ (hermes_state.py)│  │ (agent/memory_manager) │ │
+│  │ (memory_tool_store) │  │ (hermes_state.*) │  │ (agent/memory_manager) │ │
 │  │                     │  │                  │  │                        │ │
 │  │  MEMORY.md          │  │  state.db        │  │  builtin provider      │ │
 │  │  USER.md            │  │  FTS5 + trigram  │  │  + 0..1 external       │ │
@@ -25,7 +27,8 @@ Hermes remembers in three layers: a fast, curated, file-backed **core memory** t
 │                                                              │              │
 │                                                              ▼              │
 │                                                     External provider(s)    │
-│                                                     (Honcho, Mem0, ...)     │
+│                                                     (Byterover, OpenViking, │
+│                                                      Holographic, ...)      │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,10 +36,10 @@ The agent interacts with memory through four surfaces:
 
 | Surface | Lives in | Scope | Cost |
 |---|---|---|---|
-| Core memory (curated notes) | `tools/memory_tool.py` — `MemoryStore` | Global, across all sessions | File I/O only |
-| Session storage | `hermes_state.py` — `SessionDB` | Per-session messages & metadata | SQLite + FTS5 |
+| Core memory (curated notes) | `tools/memory_tool_store.py` — `MemoryStore` | Global, across all sessions | File I/O only |
+| Session storage | `hermes_state*.py` — `SessionDB` (facade + mixin modules) | Per-session messages & metadata | SQLite + FTS5 |
 | Session search | `tools/session_search_tool.py` | Cross-session recall | Zero LLM cost |
-| External memory providers | `plugins/memory/<name>/` | Backend-specific persistence | Network/daemon (async) |
+| External memory providers | `plugins/memory/<name>/` + user-installed/catalog plugins | Backend-specific persistence | Network/daemon (async) |
 
 ---
 
@@ -49,14 +52,16 @@ The built-in memory is the oldest and most stable layer. It consists of two plai
 
 These files are read **once** at agent startup, parsed into entries delimited by the section sign `§`, and injected into the system prompt as a frozen snapshot. Because the snapshot never changes mid-session, the API provider’s prompt-cache prefix remains byte-identical across every turn.
 
-### 2.1 MemoryStore (`tools/memory_tool.py`)
+### 2.1 MemoryStore (`tools/memory_tool_store.py`)
 
-`MemoryStore` is a small, bounded, file-backed append-only (plus replace/remove) store. Its design priorities are:
+`MemoryStore` was split out of `tools/memory_tool.py` (which keeps the tool wrapper, config wiring, and write-approval glue) into `tools/memory_tool_store.py`. It is a small, bounded, file-backed append-only (plus replace/remove) store. Its design priorities are:
 
-1. **Bounded size** — character limits, not tokens, because character counts are model-independent. Defaults: `2200` chars for `MEMORY.md`, `1375` for `USER.md`.
-2. **Atomic durability** — writes use `tempfile.mkstemp` + `os.replace` so readers always see either the old complete file or the new one, never a half-written buffer.
-3. **External-drift detection** — because users may append to `MEMORY.md` via the `patch` tool, shell redirection, or a concurrent session, `MemoryStore` detects non-roundtrippable content and refuses the mutation, surfacing a backup path so the operator can reconcile.
-4. **Security scanning** — every `add`/`replace` is scanned with the shared `tools/threat_patterns.py` library at `"strict"` scope, and load-time entries are also screened so a poisoned on-disk file cannot inject adversarial prompts into the system prompt. Blocked entries are replaced with `[BLOCKED: …]` placeholders in the snapshot but kept in live state so the user can inspect and remove them.
+1. **Bounded size** — character limits, not tokens, because character counts are model-independent. Defaults: `2200` chars for `MEMORY.md`, `1375` for `USER.md`; both are configurable per surface.
+2. **Per-target enablement** — each surface can be disabled in config (`memory_enabled`, `user_profile_enabled`); the tool schema is rebuilt so a disabled target is not offered to the model at all.
+3. **Atomic durability** — writes use `tempfile.mkstemp` + `os.replace`, and a cross-process advisory lock (fcntl on Unix, msvcrt on Windows) serialises mutating writers so concurrent Hermes processes (CLI + gateway + Desktop backend) cannot interleave read-modify-write cycles.
+4. **External-drift detection** — because users may append to `MEMORY.md` via the `patch` tool, shell redirection, or a concurrent session, `MemoryStore` detects non-roundtrippable content and refuses the mutation, surfacing a backup path so the operator can reconcile. Layout differences alone (blank lines around `§`, padding) are *not* drift; only content that does not round-trip back to a clean entry list is.
+5. **Security scanning** — every `add`/`replace` is scanned with the shared `tools/threat_patterns.py` library at `"strict"` scope, and load-time entries are also screened so a poisoned on-disk file cannot inject adversarial prompts into the system prompt. Blocked entries are replaced with `[BLOCKED: …]` placeholders in the snapshot but kept in live state so the user can inspect and remove them.
+6. **Consolidation-failure cap** — when the store is at capacity, the model is expected to consolidate (replace + prune) before adding. Failed at-capacity consolidation attempts are counted per turn (reset at each turn boundary); past the cap the store returns a dedicated failure class instead of letting the model spin.
 
 #### Entry lifecycle
 
@@ -90,55 +95,68 @@ When `memory.write_approval: true` is set in config, mutating actions (`add`, `r
 - **Interactive CLI** — an inline `approve / deny / stage` prompt blocks the turn.
 - **Gateway / background / script** — the write is *staged* to `$HERMES_HOME/pending/memory/<id>.json` and surfaced via `/memory pending` for later review.
 
-Staging prevents autonomous runs from silently poisoning memory.
+Staging prevents autonomous runs from silently poisoning memory. When a staged (or approved) write is finally applied, `MemoryStore` supports **pinned matched entries**: the `resolve_entry`/`resolve_batch_entries` calls capture the *full* entry each `old_text` selected at request time, and approval applies to exactly that entry — re-running the substring search at approve time could otherwise hit a newer entry that still contains it.
 
 ---
 
-## 3. Session Storage: The SQLite State Machine (`hermes_state.py`)
+## 3. Session Storage: The SQLite State Machine (`hermes_state*.py`)
 
 Every message, session boundary, compression event, and tool call is persisted to `state.db`, a SQLite database under `$HERMES_HOME`. It replaces the older per-session JSONL files and powers both analytics (dashboard, TUI sidebar) and the zero-cost `session_search` recall tool.
 
 ### 3.1 Schema
 
-Five canonical tables plus two FTS5 virtual tables:
+The canonical DDL lives in `hermes_state_common.py` (`SCHEMA_SQL`); the store is at `SCHEMA_VERSION = 31`. The core tables:
 
 ```sql
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+
+CREATE TABLE system_prompts (
+    hash TEXT PRIMARY KEY,        -- content-addressed; sessions reference it
+    prompt TEXT NOT NULL
+);
+
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,          -- 'cli', 'telegram', 'discord', 'cron', ...
-    user_id TEXT,
+    created_source TEXT,           -- provenance of the row (immutable, #56439)
+    user_id TEXT, session_key TEXT, chat_id TEXT, chat_type TEXT,
+    thread_id TEXT, display_name TEXT, origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
     model TEXT,
     model_config TEXT,             -- JSON blob
     system_prompt TEXT,
+    system_prompt_hash TEXT,       -- FK -> system_prompts(hash)
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,               -- 'compression', 'branched', 'user_exit', ...
     message_count INTEGER DEFAULT 0,
     tool_call_count INTEGER DEFAULT 0,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    cache_read_tokens INTEGER DEFAULT 0,
-    cache_write_tokens INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
-    cwd TEXT,
-    billing_provider TEXT,
-    billing_base_url TEXT,
-    billing_mode TEXT,
-    estimated_cost_usd REAL,
-    actual_cost_usd REAL,
-    cost_status TEXT,
-    cost_source TEXT,
-    pricing_version TEXT,
-    title TEXT,
+    cwd TEXT, git_branch TEXT, git_repo_root TEXT,
+    git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+    billing_provider TEXT, billing_base_url TEXT, billing_mode TEXT,
+    estimated_cost_usd REAL, actual_cost_usd REAL,
+    cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+    title TEXT, title_source TEXT,
+    last_activity_at REAL, last_activity_description TEXT, last_activity_provenance TEXT,
     api_call_count INTEGER DEFAULT 0,
-    handoff_state TEXT,
-    handoff_platform TEXT,
-    handoff_error TEXT,
+    handoff_state TEXT, handoff_platform TEXT, handoff_error TEXT,
+    compression_failure_cooldown_until REAL, compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    compression_recovery_deadline REAL,
+    compression_overload_streak INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT, transport_profile TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+    auto_archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL, tool_names TEXT,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
 
 CREATE TABLE messages (
@@ -153,14 +171,19 @@ CREATE TABLE messages (
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,
-    reasoning TEXT,
-    reasoning_content TEXT,
-    reasoning_details TEXT,
-    codex_reasoning_items TEXT,
-    codex_message_items TEXT,
+    reasoning TEXT, reasoning_content TEXT, reasoning_details TEXT,
+    codex_reasoning_items TEXT, codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1
+    _compressed_summary INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    compacted INTEGER NOT NULL DEFAULT 0,     -- archived behind a compaction summary, still durable
+    api_content TEXT,              -- byte-fidelity sidecar of what the API actually saw
+    display_kind TEXT, display_metadata TEXT,
+    display_identity BLOB, display_order INTEGER,   -- stable transcript-display identity
+    message_uid TEXT,              -- durable per-row identity for resume/repair
+    absorbed_message_uids TEXT,    -- uids folded into this row by compaction
+    tool_call_uids TEXT, tool_call_uid TEXT  -- per-occurrence uid pairing calls with results
 );
 
 CREATE TABLE session_model_usage (
@@ -169,66 +192,88 @@ CREATE TABLE session_model_usage (
     billing_provider TEXT NOT NULL DEFAULT '',
     billing_base_url TEXT NOT NULL DEFAULT '',
     billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '', -- auxiliary task class (compression, titles, ...)
     api_call_count INTEGER NOT NULL DEFAULT 0,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0,
-    actual_cost_usd REAL NOT NULL DEFAULT 0,
-    cost_status TEXT,
-    cost_source TEXT,
-    first_seen REAL,
-    last_seen REAL,
-    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode)
+    input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    estimated_cost_usd REAL DEFAULT 0, actual_cost_usd REAL DEFAULT 0,
+    cost_status TEXT, cost_source TEXT,
+    first_seen REAL, last_seen REAL,
+    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
-CREATE TABLE state_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
+CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE TABLE compression_locks (
-    session_id TEXT PRIMARY KEY,
-    holder TEXT NOT NULL,
-    acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    session_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL, expires_at REAL NOT NULL
+);
+
+CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL, expires_at REAL NOT NULL
+);
+
+CREATE TABLE gateway_routing (
+    scope TEXT NOT NULL DEFAULT '', session_key TEXT NOT NULL,
+    entry_json TEXT NOT NULL, updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, session_key)
+);
+
+CREATE TABLE gateway_hygiene_state (session_key TEXT PRIMARY KEY, failure_streak INTEGER NOT NULL DEFAULT 0);
+
+CREATE TABLE conversation_generations (
+    source TEXT NOT NULL, session_key TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, session_key)
+);
+
+CREATE TABLE gateway_heartbeats (
+    backend_id TEXT PRIMARY KEY, pid INTEGER NOT NULL,
+    started_at REAL NOT NULL, last_heartbeat REAL NOT NULL,
+    profile TEXT NOT NULL DEFAULT '', host TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    origin_session_id TEXT NOT NULL DEFAULT '',
     parent_session_id TEXT,
     state TEXT NOT NULL,
-    dispatched_at REAL NOT NULL,
-    completed_at REAL,
-    updated_at REAL NOT NULL,
-    event_json TEXT,
-    result_json TEXT,
+    dispatched_at REAL NOT NULL, completed_at REAL, updated_at REAL NOT NULL,
+    event_json TEXT, result_json TEXT, task_json TEXT,
     delivery_state TEXT NOT NULL DEFAULT 'pending',
-    delivery_attempts INTEGER NOT NULL DEFAULT 0,
-    delivered_at REAL,
-    owner_pid INTEGER,
-    owner_started_at INTEGER,
-    task_json TEXT,
-    delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_attempts INTEGER NOT NULL DEFAULT 0, delivered_at REAL,
+    delivery_claim TEXT, delivery_claimed_at REAL,
+    owner_pid INTEGER, owner_started_at INTEGER
 );
 ```
+
+An index on `async_delegations(delivery_state, completed_at)` supports efficient polling for pending deliveries; display-related message indexes and the `message_uid` minting trigger are created in a deferred pass (`DEFERRED_INDEX_SQL`) that runs after `_reconcile_columns()` so legacy databases get them too.
+
+A few of the newer mechanisms deserve their own notes:
+
+- **`system_prompts`** — system prompts are content-addressed by hash and sessions reference the hash, so identical prompts are stored once.
+- **`conversation_generations`** — a never-garbage-collected, monotonic per-peer counter. A gateway conversation key is per-chat and outlives any single conversation on it; deriving the prompt-cache affinity scope from session rows cannot prove non-reuse (deletes and prunes remove the evidence), so each conversation boundary increments this counter instead and a generation is never re-issued to a peer, closing the ABA where a new conversation inherits a retired affinity identity.
+- **`gateway_heartbeats`** — each gateway/tui-gateway backend registers a heartbeat row so the startup orphan sweep can tell a dead holder from an idle one on a shared `state.db`.
+- **`session_turn_leases`** — per-conversation turn ownership, swept when holders die (see §3.2 and §3.6).
 
 Two FTS5 virtual tables index message content:
 
 - `messages_fts` — standard `unicode61` tokenizer for English/ASCII search.
 - `messages_fts_trigram` — `tokenize='trigram'` for CJK substring search.
 
-Both index `content || ' ' || tool_name || ' ' || tool_calls` so tool-call arguments and tool-result summaries are searchable alongside prose.
+Both are external-content tables over a stable projection view (`messages_fts_src`): tool-result rows are indexed as a bounded prefix rather than in full, and the view, triggers, and backfill all share one content expression so FTS5's `rebuild`/integrity checks always agree with the stored tokens. This closed the recurring `fts5` checksum-mismatch drift where the index and the table disagreed on what had been indexed. A schema-v23 deferred-rebuild protocol (state_meta keys `fts_rebuild_high_water` and `fts_rebuild_progress`) tracks which rows are in the index while a background rebuild is pending, and every trigger gates on that predicate — firing an external-content delete for a row that is not in the index corrupts it.
 
 ### 3.1.1 Per-model usage attribution (`session_model_usage`, v20)
 
 The `sessions` row stores only one `(model, billing_provider)` pair, so a mid-session `/model` switch would attribute every token to the initial model (issue #51607). Schema v20 introduces the `session_model_usage` table to record per-API-call token deltas keyed by `(session_id, model, billing_provider, billing_base_url, billing_mode)`.
 
 `update_token_counts()` now records each incremental call's delta via `_record_model_usage()`, which runs inside the caller's write transaction (after the `sessions` UPDATE) so per-model rows stay consistent with the summary row. When the caller omits the model/provider, `_record_model_usage()` falls back to the values already recorded on the session row — the same COALESCE-from-session behaviour the summary update uses. Absolute cumulative updates (which cannot be split back into per-model routes) are skipped; Insights reconciles any positive residual against the aggregate session row instead.
+
+The PK has since gained a `task` dimension (the auxiliary task class — compression, titles, etc.), so side-task spend is attributed separately from the main conversation rather than polluting the main model's numbers.
 
 The v20 migration seeds one usage row per historical session from the aggregate totals on `sessions` using `INSERT OR IGNORE` so it is idempotent: if newer code already wrote a `(session_id, model, provider)` row, the PK conflict skips the stale aggregate rather than doubling it.
 
@@ -243,6 +288,7 @@ The `async_delegations` table provides durable persistence for asynchronous task
 - `event_json` / `result_json` / `task_json` — the original task, its result, and the triggering event.
 - `delivery_state` / `delivery_attempts` / `delivery_claim` / `delivery_claimed_at` — delivery tracking for returning results to the origin session.
 - `owner_pid` / `owner_started_at` — the process that owns the delegation at any given time.
+- `origin_ui_session_id` / `origin_session_id` — the UI-facing and canonical origin session; `origin_session_id` is canonicalised in the store's own DDL so the fresh-install shape matches the delegation tool's lazy schema exactly (schema drift between two databases at the same version broke rebuild/replay pipelines, #94691).
 
 An index on `(delivery_state, completed_at)` supports efficient polling for pending deliveries.
 
@@ -252,16 +298,31 @@ The `messages` table carries an `effect_disposition TEXT` column (v21) that trac
 
 ### 3.1.4 Compression fallback streak
 
-The `sessions.compression_fallback_streak INTEGER NOT NULL DEFAULT 0` column (v21) persists a per-session count of consecutive compression fallbacks — situations where the LLM compressor fails and the system falls back to the local deletion compressor. `get_compression_fallback_streak(session_id)` reads the current streak (returning 0 for unknown sessions or null values), and `set_compression_fallback_streak(session_id, streak)` writes it back, normalising to a non-negative integer. The streak allows the compressor to make informed decisions about when to stop attempting LLM-based compression and commit to the fallback path.
+The `sessions.compression_fallback_streak INTEGER NOT NULL DEFAULT 0` column (v21) persists a per-session count of consecutive compression fallbacks — situations where the LLM compressor fails and the system falls back to the local deletion compressor. `get_compression_fallback_streak(session_id)` reads the current streak (returning 0 for unknown sessions or null values), and `set_compression_fallback_streak(session_id, streak)` writes it back, normalising to a non-negative integer. The streak allows the compressor to make informed decisions about when to stop attempting LLM-based compression and commit to the fallback path. (Related columns: `compression_ineffective_count`, `compression_overload_streak`, `compression_failure_cooldown_until` — together they persist the compressor's budget and cooldown so fresh bindings inherit them.)
+
+### 3.1.5 Row identity, compaction, and the `api_content` sidecar
+
+Three later schema features changed how transcript rows are addressed and replayed:
+
+- **`message_uid`** — every persisted message row carries a durable uid (minted by a trigger even for rows written by older builds). A uid survives compaction: when rows are folded into a summary, the survivor's `absorbed_message_uids` records exactly which uids it subsumes. Tool calls and their results are paired with per-occurrence uids (`tool_call_uid` / `tool_call_uids`), so a rewrite or fold of repeated ids can never unpair a call from its result.
+- **Replay digest vs row-addressed resume** — the live in-memory transcript is normally persisted by *digest matching*: the agent sends the current message dicts and the store matches them against durable rows by content digest. When a resume path knows the exact row addresses (`include_row_ids`), it instead persists *row-addressed*: the stored uid wins over whatever the live dict claims, and the digest is not consulted. Repairs and clones follow the same rule — legacy dicts without a digest are treated as row-addressed rewrites that keep the row's identity rather than duplicating it.
+- **`api_content`** — a byte-fidelity sidecar storing the *exact* string sent to the API for a user row (what the sanitizer stripped, the surrogate-scrubbed bytes, the wire form). `set_latest_user_api_content()` backfills the newest active user row (preflight compaction), `set_message_api_content()` targets one known durable row, and on restore `api_content` is returned VERBATIM (no sanitize/strip) so a resumed conversation re-sends precisely what the model saw before. `display_kind` / `display_metadata` / `display_identity` / `display_order` are the display-projection counterparts: they give the UI a stable, trigger-maintained identity/order per message that survives in-place compaction.
 
 ### 3.2 Write resilience
 
 Because the DB is shared across processes (gateway workers, CLI sessions, cron runners, desktop readers), writes use:
 
-- **WAL mode** with `DELETE` fallback on NFS/SMB/FUSE filesystems that cannot support WAL (`journal_mode=WAL` raises `OperationalError("locking protocol")`).
-- **Application-level retry with jitter** — `BEGIN IMMEDIATE`, then on `database is locked` sleep a random `20–150 ms` and retry up to 15 times. This breaks the convoy pattern that SQLite's deterministic internal backoff creates.
-- **Periodic TRUNCATE checkpoints** every 50 writes to keep the WAL file from growing without bound.
+- **WAL mode** with `DELETE` fallback on filesystems that cannot support WAL — the incompatibility markers are `locking protocol` (NFS/SMB/WSL1), `not authorized` (some FUSE mounts), and `disk i/o error` (ZFS corrupts the `-shm` file under concurrent bursts via copy-on-write + mmap). Either failure would silently break everything, so the store falls back to DELETE (readers block on writes) and logs a once-per-process warning.
+- **WAL-reset-bug refusal** — SQLite builds in the 3.7.0–3.51.2 range carry the upstream WAL-reset bug (fixed in 3.51.3, backported to 3.50.7 and 3.44.6; see sqlite.org/wal.html#walresetbug). On a vulnerable build `hermes_state_wal` refuses to enable WAL on a non-WAL file and uses DELETE instead — a WAL reset on those builds can discard committed frames. The runtime probe (`hermes_cli/sqlite_runtime.py`) reports the linked SQLite version so installers and doctor can name the problem.
+- **Application-level retry with jitter, TIME-based** — `BEGIN IMMEDIATE`, then on `database is locked` sleep a random `20–150 ms`, escalating to `250 ms–1 s` after 2 seconds of contention. Patience is a *time budget*, not an attempt count: `20 s` for routine writes, `60 s` for transcript writes (whose failure aborts the turn), `0.5 s` for observation-only heartbeat/label writes on the response-critical path, and `5 s` for a live compression lease (which is a correctness boundary, not just a busy signal). Attempt-counted budgets destroyed turns on a healthy store; a sibling legitimately holding the lock for seconds is normal (checkpoint at close, VACUUM, recovery).
+- **Bounded PASSIVE checkpoints** — a `PRAGMA wal_checkpoint(PASSIVE)` every 50 successful writes keeps the WAL file bounded; `journal_size_limit` is raised to 64 MiB so checkpointed space is actually returned to the filesystem (SQLite's default is unlimited).
+- **Bounded FTS merges** — FTS5 `'optimize'` costs 9–18 s per index on a large DB, longer than a writer's patience, so instead a bounded `'merge'` runs every 1,000 writes (capped pages per index, stopping on no-progress).
 - **macOS `synchronous=FULL` enforcement** — after any successful WAL activation, `_enforce_macos_synchronous_full()` sets `PRAGMA synchronous=FULL` on macOS. macOS's `fsync()` does *not* guarantee data-on-platter or write-ordering (per Apple's `fsync(2)` man page), so the WAL default of `synchronous=NORMAL` can leave the main DB with half-written btree pages during a checkpoint race with process termination (e.g. launchd shutdown), resulting in `btreeInitPage error 11` corruption. `synchronous=FULL` issues a real `fsync()` on every transaction commit. The companion `_apply_macos_checkpoint_barrier()` enables `checkpoint_fullfsync=1`, which forces an `F_FULLFSYNC` barrier at checkpoint boundaries (where WAL frames land in the main DB). Both functions are no-ops on non-Darwin platforms and are best-effort (never raise).
+
+Two more resource guards protect read-heavy deployments:
+
+- **Read-connection pool** (`hermes_state_readpool.py`) — read-only connections are budgeted: at most 8 alive per database file, 24 per process across all profiles' `state.db`s, and a descriptor-headroom gate yields the pool when the *process* is close to its fd limit (whatever is consuming it — an EMFILE surfaced in an unrelated tool is still an outage). Idle pooled readers keep their permit and are reclaimable across peers on the same path. Past a ceiling, reads degrade to the (shared) writer connection — slower, but never a wedge.
+- **PID-namespace-qualified lock holders** (`hermes_state_pidns.py`) — lock/lease holder rows record a pid plus its PID namespace, so a stale holder is only probed/broken when the recorded pid is actually checkable from this namespace. Without that qualification a container restart can reuse a pid and make a dead holder look alive (or a live one look dead).
 
 Malformed-schema recovery (duplicate `sqlite_master` rows, typically from FTS5 corruption) is handled automatically: `repair_state_db_schema` attempts a `sqlite_master` de-duplication pass, then falls back to dropping and rebuilding the FTS layer while preserving canonical `sessions`/`messages` rows.
 
@@ -269,21 +330,21 @@ Malformed-schema recovery (duplicate `sqlite_master` rows, typically from FTS5 c
 
 When a conversation exceeds the model’s context threshold, the `ContextCompressor` splits the session: it ends the old session with `end_reason='compression'`, creates a new child session with `parent_session_id` pointing to the old one, and carries the compressed summary forward. The state store treats compression children differently from branch children (`/branch`) and delegate subagent runs — compression children stay hidden in session pickers so the user sees a single logical conversation, while branch children remain visible.
 
-A `compression_locks` table prevents two compressors from racing on the same session ID (e.g. parent agent + background-review fork both deciding to compress simultaneously). Locks expire after 5 minutes; a crashed compressor never blocks the session forever.
+A `compression_locks` table prevents two compressors from racing on the same session ID (e.g. parent agent + background-review fork both deciding to compress simultaneously). Locks expire after 5 minutes (TTL 300 s, refreshable by the owner); a crashed compressor never blocks the session forever. A lock is additionally reclaimed when its holder string identifies a process that is provably dead — checked with PID-namespace awareness (§3.2) so a recycled pid inside a container cannot fake liveness.
 
 `get_compression_lineage()` walks the parent→child chain to reconstruct the full compression lineage for a session. It uses `ancestors` and `seen` sets to detect and break cycles in malformed compression parent/child chains, preventing infinite loops. If a parent or child has already been visited (its ID is in the set), the walk terminates rather than looping forever.
 
 ### 3.4 Declarative schema evolution
 
-Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 21`).
+Column additions are handled by `_reconcile_columns()`, which diffs live tables against the canonical `SCHEMA_SQL` on every startup and `ALTER TABLE ADD COLUMN`s anything missing. Data migrations that transform existing rows still live in a version-gated chain (`SCHEMA_VERSION = 31`). Migrations above the pure-column baseline include the FTS5 storage-version migration (schema v23, which moved `messages_fts` onto the stable projection view and can defer its index rebuild to a background pass) and the `message_uid` backfill, which runs in bounded slices instead of one startup UPDATE over the whole table.
 
 ### 3.5 Workspace grouping (`workspace_key()`)
 
 The top-level `workspace_key(row)` function returns a session's workspace grouping key: its `git_repo_root` when known, else its `cwd`. Branch is deliberately excluded so checking out a new branch doesn't fragment a workspace's session history. Returns `None` for cwd-less (unbound) sessions. Both fields are already recorded on the `sessions` row — this function just picks the coarser identity for grouping and filtering.
 
-### 3.6 Session recovery (`ws_orphan_reap`)
+### 3.6 Session recovery (recoverable end reasons)
 
-`find_latest_gateway_session_for_peer()` (used by `recover_session_for_session_key()`) treats `end_reason='ws_orphan_reap'` as recoverable alongside `agent_close`. The `ws_orphan_reap` end_reason is set when a dashboard viewer disconnects (before the fix in #60609), which previously left gateway sessions unrecoverable after a viewer disconnect bug. Treating it as recoverable ensures the session can be resumed rather than silently orphaned.
+`find_latest_gateway_session_for_peer()` (used by `recover_session_for_session_key()`) treats a set of end reasons as *recoverable* — a session ended this way can be resumed rather than orphaned. The set (`_RECOVERABLE_END_REASONS` in `hermes_state_common.py`) is currently `agent_close`, `ws_orphan_reap`, `superseded_by_resume`, and `startup_orphan_reap`. `ws_orphan_reap` dates from the dashboard-viewer-disconnect bug (#60609) that left gateway sessions silently abandoned; `superseded_by_resume` marks a session another process resumed over (the old holder must not keep writing); `startup_orphan_reap` is the dead-gateway sweep that consults `gateway_heartbeats` (§3.1) so idle-but-live backends are not reaped on a shared `state.db`. Recovery is also profile-fenced: a session cannot be recovered outside its owning profile.
 
 ### 3.7 Session import
 
@@ -319,6 +380,8 @@ The tool infers its mode from the arguments rather than an explicit mode paramet
    - `bookend_end` — last 3 user/assistant messages (the resolution).
    - `match_message_id`, `messages_before`, `messages_after`.
 
+   A session **title** that matches the query also surfaces as a discovery entry (hydrated with the same caps as FTS hits), and discovery honours `after`/`before` time bounds and `exclude_session_ids`. Compaction handoff summaries are excluded from bookends so a compressed session's bookend reads as the real kickoff/resolution.
+
 2. **SCROLL** — `session_id` + `around_message_id`  
    Returns a ±`window` slice centred on the anchor. No FTS5, no bookends. The caller scrolls forward/backward by re-anchoring on the last/first message ID of the returned window.
 
@@ -347,21 +410,21 @@ Role filtering defaults to `user,assistant` so tool-output noise is excluded fro
 
 ### 4.3 Cross-profile reads
 
-The tool accepts a `profile` argument for read-only access to another profile’s `state.db` (e.g. resolving an `@session:work/2026…` link the user dropped into chat). If the model omits the profile, a `_locate_session_db` scan walks every profile’s DB to find the session ID.
+The tool accepts a `profile` argument for read-only access to another profile's `state.db` (opened `mode=ro`, safe on a live DB). Profiles are isolation islands: a *bare* session id never falls through to a scan of every other profile's DB — that scan returned another profile's full transcript to any caller holding an id (#106761), so it was removed. A miss in the current profile returns an error with the exact remediation: pass `profile=<name>` or use the `@session:<profile>/<id>` link syntax the tool renders in its own output.
 
 ---
 
 ## 5. Pluggable Memory Providers (`agent/memory_provider.py`, `agent/memory_manager.py`, `plugins/memory/`)
 
-Beyond the built-in file-backed memory and session DB, Hermes supports external memory backends — Honcho, Mem0 (cloud and self-hosted), Supermemory, Byterover, Hindsight, Holographic, OpenViking, RetainDB, and any user-installed plugin implementing the `MemoryProvider` ABC.
-
-### Mem0 Self-Hosted Mode
-
-Mem0 can run in either cloud or self-hosted mode. The self-hosted mode includes a dashboard backend and configurable recall tuning (rerank, host routing precedence). The setup wizard supports both modes, and the SDK is lazy-installed (like honcho/hindsight) so missing dependencies don't block startup.
+The provider landscape was restructured: providers that used to ship in-tree — Honcho, Mem0, Supermemory, Hindsight — have **left core** and now install from the plugin catalog (see §5.6). The bundled `plugins/memory/` directory currently contains **Byterover**, **Holographic**, **OpenViking**, and **RetainDB**, plus `config_schema.py` and `query_rewrite.py` helpers. Any user-installed plugin implementing the `MemoryProvider` ABC is equally usable.
 
 ### Holographic Memory FTS5 Sanitizer
 
 The Holographic memory provider applies an FTS5 query sanitizer to `search_facts` and natural-language recall queries, preventing malformed FTS5 syntax from causing search failures. This mirrors the same sanitization logic used by `session_search`.
+
+### Holographic compaction-summary harvesting
+
+Holographic's end-of-session fact extraction (`on_session_end`) is compaction-aware. Compaction handoff summaries arrive as `role="user"` rows and would otherwise be stored as if the user had asserted them; the provider skips any message the compressor generated (`is_compaction_summary_message`). Merge-into-tail rows hold genuine prior user text *before* `_MERGED_SUMMARY_DELIMITER` and the summary after it, so the provider harvests only the pre-delimiter segment — genuine user content is never lost, and the compactor's own output is never ingested as a fact.
 
 ### 5.1 The one-external-provider rule
 
@@ -384,29 +447,35 @@ The builtin provider (name `"builtin"`) is always accepted; external providers a
 
 ```
 MemoryProvider (ABC)
-  ├── name: str
-  ├── is_available() -> bool
-  ├── initialize(session_id, **kwargs)
+  ├── name: str                                        (abstract property)
+  ├── is_available() -> bool                           (abstract)
+  ├── initialize(session_id, **kwargs)                 (abstract)
   ├── system_prompt_block() -> str        (static prompt text)
-  ├── prefetch(query, session_id="") -> str
-  ├── queue_prefetch(query, session_id="")
-  ├── sync_turn(user_content, assistant_content, *, session_id, messages)
-  ├── get_tool_schemas() -> List[Dict]
+  ├── prefetch(query, *, session_id="") -> str
+  ├── queue_prefetch(query, *, session_id="")
+  ├── recall_status() -> Optional[RecallStatus]
+  ├── sync_turn(user_content, assistant_content, *, session_id, messages, turn_author=None)
+  ├── get_tool_schemas() -> List[Dict]                 (abstract)
   ├── handle_tool_call(tool_name, args, **kwargs) -> str
   ├── shutdown()
   └── optional hooks:
       ├── on_turn_start(turn_number, message, **kwargs)
+      ├── identity_signature() -> Dict
       ├── on_session_end(messages)
-      ├── on_session_switch(new_session_id, parent_session_id, reset, rewound)
+      ├── on_session_switch(new_session_id, *, parent_session_id, reset, rewound)
       ├── on_pre_compress(messages) -> str
+      ├── on_delegation(task, result, *, child_session_id)
+      ├── get_config_schema() / save_config(values, hermes_home)
       ├── on_memory_write(action, target, content, metadata)
-      └── on_delegation(task, result, child_session_id)
+      └── backup_paths() -> List[str]
 ```
 
-- `initialize()` receives `hermes_home`, `platform`, `agent_context`, `agent_identity`, `user_id`, `parent_session_id`, and other runtime context so providers can scope their storage correctly.
-- `sync_turn()` is called after every completed turn to persist the exchange. The manager strips skill-scaffolding text before forwarding so providers don’t ingest prompt-injection artifacts.
-- `prefetch()` runs before the next API call, returning context text to inject into the user-visible turn. Results from all providers are merged and wrapped in `<memory-context>` fences with a system note instructing the model to treat the content as authoritative reference data.
-- `queue_prefetch()` triggers a background recall immediately after the turn, so the next `prefetch()` can return a cache hit.
+- `initialize()` receives `hermes_home` (profile-scoped storage; never hardcode `~/.hermes`), `platform`, `agent_context` (`primary` | `subagent` | `cron` | `flush` — providers should skip writes for non-primary contexts), `agent_identity`, `agent_workspace`, `user_id`, `user_id_alt`, `parent_session_id`, and other runtime context so providers can scope their storage correctly.
+- `sync_turn()` is called after every completed turn to persist the exchange. The manager strips skill-scaffolding text before forwarding so providers don’t ingest prompt-injection artifacts, and sends `turn_author` (`{"id", "name", "is_bot"}`) to providers whose signature accepts it — a shared gateway session carries several participants, so a provider keying durable state on identity must read it per turn.
+- `prefetch()` runs before the next API call, returning context text to inject into the user-visible turn. Results from all providers are merged and wrapped in `<memory-context>` fences with a system note instructing the model to treat the content as authoritative reference data. Oversized external-prefetch results are spilled to disk like plugin hook output (`tools/hook_output_spill.py`) so one provider cannot inflate the prompt prefix; an external provider's prefetch is additionally bounded by a timeout (`_EXTERNAL_PREFETCH_TIMEOUT_S`, 8 s).
+- `queue_prefetch()` triggers a background recall immediately after the turn, so the next `prefetch()` can return a cache hit. The whole pipeline is gated by `is_trivial_prompt()`: empty input, slash commands, and bare greetings/acknowledgements skip recall entirely — a round-trip saved, and stale context kept from derailing one-word replies.
+- `recall_status()` feeds the deterministic recall indicator (`MemoryManager.describe_recall()`), the `🧠 Provider — recalled N memories` line rendered right after prefetch so the user sees memory was used even if the model is silent.
+- Background provider work must run under the *caller's* contextvars (`ctx_bound` / `spawn_context_thread` in `agent/memory_provider.py`): profile isolation is a ContextVar-scoped `HERMES_HOME` override, and a worker thread started with an empty context silently lands on the default profile or fails closed on secrets.
 
 ### 5.3 MemoryManager orchestration
 
@@ -431,31 +500,44 @@ self._memory_manager.queue_prefetch_all(user_msg)
 
 **Background sync** — `sync_all` and `queue_prefetch_all` dispatch work to a single-worker `ThreadPoolExecutor` (created lazily) so a wedged daemon cannot stall the turn-completion path. The executor is serialised (max_workers=1) so turn N is guaranteed to land before turn N+1 in the provider’s store.
 
-**Draining on exit** — `shutdown_all()` first submits a sentinel to the executor and waits up to `_SYNC_DRAIN_TIMEOUT_S` (5 seconds) so the final turn of a session has a chance to persist before providers are torn down.
+**Draining on exit** — `shutdown_all()` first gives the queued FIFO work a bounded chance (`_SYNC_DRAIN_TIMEOUT_S`, 5 seconds: the executor is shut down with `wait=False` and the tracked futures are waited on, so a single worker completing the last task proves every earlier task ran), then abandons explicitly. Timed-out futures are cancelled where possible and the drain outcome — `abandoned_writes`, `abandoned_prefetches`, `active_tasks` — is exposed on `shutdown_drain_state` for telemetry, so a shutdown either proves the final turn persisted or *says* what it dropped. Providers are then shut down in reverse registration order.
+
+**Bounded recall** — an external provider's `prefetch()` runs on a dedicated thread with an 8-second timeout rather than inline; a hung backend yields an empty context after 8 s instead of stalling the turn.
 
 ### 5.4 Tool injection
 
-Providers may expose their own tools (e.g. `honcho_add_memory`, `mem0_search`). `MemoryManager.get_all_tool_schemas()` collects schemas from all registered providers and injects them into the agent’s tool surface via `inject_memory_provider_tools()`. Reserved core tool names (`clarify`, `delegate_task`, etc.) are skipped — builtins always win.
+Providers may expose their own tools (e.g. the bundled Holographic provider's `fact_*` tools, or an OpenViking retrieval tool). `MemoryManager.get_all_tool_schemas()` collects schemas from all registered providers and injects them into the agent’s tool surface via `inject_memory_provider_tools()`. Reserved core tool names are checked against `_HERMES_CORE_TOOLS` at *registration* (not just at injection): a shadowing name is ignored at the door so it never enters the routing table — builtins always win. Whether provider tools are exposed at all is also gated by the active toolsets (`memory_provider_tools_enabled()`).
 
 ### 5.5 Provider discovery (`plugins/memory/__init__.py`)
 
-Discovery scans two directories:
+Discovery scans, in precedence order:
 
 1. **Bundled** — `plugins/memory/<name>/` (in-repo providers).
-2. **User-installed** — `$HERMES_HOME/plugins/<name>/` (standalone repos, pip entry points).
+2. **User-installed** — `$HERMES_HOME/plugins/<name>/` (standalone repos).
+3. **Project-local** — `./.hermes/plugins/<name>/` (opt-in via `HERMES_ENABLE_PROJECT_PLUGINS` — a repo you merely `cd` into must not offer a memory backend).
+4. **Entry points** — the `hermes_agent.memory_providers` group.
 
-Bundled providers take precedence on name collision. The active provider is loaded by `load_memory_provider(configured_name)` and registered with `MemoryManager.add_provider()`.
+Bundled providers take precedence on name collision — the *reverse* of PluginManager's later-source-wins rule, and deliberately so: a provider is activated by name (`memory.provider`, one at a time), so a directory dropped into the working tree must never shadow a shipped provider. A user-installed provider is imported under a synthetic namespace (`_hermes_user_memory.<name>__source_<digest>`) so its package tree and relative imports can't collide with a bundled one. Candidate directories are screened cheaply (does `__init__.py` mention the provider contract?), then verified by *parsing* (never importing) the package's top-level modules for a `register_memory_provider(...)` call or a `MemoryProvider` subclass. The active provider is loaded by `load_memory_provider(configured_name)` and registered with `MemoryManager.add_provider()`; registering a memory provider also retracts/re-scopes its skills per Hermes home.
 
 > **Policy (May 2026):** the set of in-tree memory providers is closed. New backends must ship as standalone plugin repos that implement the same `MemoryProvider` ABC and register through the same discovery path.
 
-### 5.6 Context fencing
+### 5.6 Providers leaving core: catalog migration (`hermes_cli/memory_provider_migration.py`)
+
+The closure policy was put into effect: Honcho, Mem0, Supermemory, and Hindsight were removed from the bundled tree and moved to the plugin catalog (Byterover, OpenViking, RetainDB, Holographic are still bundled but are on the same list for migration purposes). A configured provider whose code can no longer be found must never silently become "no memory", so two hooks migrate users:
+
+- **`hermes update`** — `migrate_all_homes()` walks every profile home sharing the venv, groups homes by provider and consent, and installs the catalog entry at its reviewed pin through the normal plugin install path (kill list, dependency constraints, enable) — never a custom source. Homes missing the same provider share one set of dependency answers.
+- **Agent init** — `recover_at_startup()` fires when the configured provider resolves nowhere, once per process per home. It cannot answer a dependency prompt, so it installs only with consent: a provider that shipped in core carries the consent its built-in had; anything else just gets pointed at `hermes plugins install <name>`.
+
+Every outcome — installed, refused, failed, absent from the catalog — reaches the user (terminal, Desktop, chat platform), never only `agent.log`: a provider that silently stays missing is lost memory. The same helpers back `doctor`, `memory status`, and `hermes memory setup`, which print the one command that fixes a missing provider.
+
+### 5.7 Context fencing
 
 Provider output that reaches the UI must not leak raw `<memory-context>` tags or injected system notes. `MemoryManager` handles this in two ways:
 
 - **One-shot scrubbing** — `sanitize_context()` strips fence tags, pre-wrapped context blocks, and system-note lines from provider output using compiled regexes.
 - **Streaming scrubbing** — `StreamingContextScrubber` maintains a small state machine across streaming deltas so that a `<memory-context>` opened in one chunk and closed in a later chunk is fully suppressed. Partial-tag tails are held back in an internal buffer and either discarded or emitted on `flush()`.
 
-### 5.7 Skill-scaffolding stripping
+### 5.8 Skill-scaffolding stripping
 
 When the user invokes a `/skill` or `/bundle`, Hermes expands the turn into a model-facing message embedding the entire skill body. Feeding that verbatim to memory providers would pollute their stores with prompt scaffolding. `MemoryManager._strip_skill_scaffolding()` extracts just the user’s actual instruction before passing it to `prefetch_all` and `sync_all`. This stripping is applied to **all** providers, not just a single provider — it is a universal preprocessing step.
 
@@ -465,27 +547,11 @@ When the user invokes a `/skill` or `/bundle`, Hermes expands the turn into a mo
 
 While not strictly part of the memory subsystem, the auxiliary client is the bridge that memory providers (and session compression, title generation, web extraction, vision analysis) use when they need a side LLM call. It provides a single resolution chain so every consumer picks up the best available backend without duplicating fallback logic.
 
-### 6.1 Resolution order (auto mode)
+The full picture — resolution order, the recovery ladder, transport adapters, per-task overrides — lives in §11 below; the essentials:
 
-For **text** tasks:
-1. User’s main provider + main model
-2. OpenRouter (`OPENROUTER_API_KEY`)
-3. Nous Portal (`~/.hermes/auth.json` active provider)
-4. Custom endpoint (`base_url` + `OPENAI_API_KEY`)
-5. Native Anthropic
-6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, …)
-
-For **vision/multimodal** tasks the order is similar but skips providers without vision support (e.g. Kimi Coding Plan routes).
-
-Per-task overrides live in `config.yaml` under the `auxiliary:` section (e.g. `auxiliary.compression.provider`, `auxiliary.vision.model`).
-
-### 6.2 Credit-exhaustion fallback
-
-When a resolved provider returns HTTP 402 or a credit-related error, `call_llm()` automatically retries with the next provider in the chain. This handles the common case where a user depletes OpenRouter balance but still has Codex OAuth or another provider available.
-
-### 6.3 Temperature and compaction overrides
-
-Certain models have strict server-side contracts. The auxiliary client returns `OMIT_TEMPERATURE` for Kimi/Moonshot models (whose gateways manage temperature internally) and clamps Arcee Trinity Large Thinking to `0.5`. It also raises the context-compression threshold to `0.85` for Codex GPT-5.5 because the backend caps the effective window at 272K, making the default 50% trigger wastefully early.
+- Resolution in auto mode starts at the user's main provider + model, then walks OpenRouter → Nous Portal → custom endpoints → native Anthropic → direct API-key providers; vision tasks skip providers without image support.
+- HTTP 402 / credit-related errors fall through to the next candidate automatically (`call_llm()`), so an exhausted OpenRouter balance doesn't kill compression when another provider is available.
+- Per-task overrides live in `config.yaml` under `auxiliary:` (e.g. `auxiliary.compression.provider`, `auxiliary.vision.model`).
 
 ---
 
@@ -497,7 +563,8 @@ Certain models have strict server-side contracts. The auxiliary client returns `
 | Full message history | `state.db` → `messages` | Every turn | Includes tool_calls JSON, reasoning fields |
 | Session metadata (model, tokens, cost, title) | `state.db` → `sessions` | Session start / end / compression | `update_token_counts` increments per API call |
 | Per-model usage attribution | `state.db` → `session_model_usage` | Every API call (incremental) | Per-call deltas keyed by `(session_id, model, provider)`; fixes mid-session `/model` switch attribution |
-| FTS5 index | `messages_fts`, `messages_fts_trigram` | Triggered on INSERT/UPDATE/DELETE | Rebuilt on schema migration |
+| FTS5 index | `messages_fts`, `messages_fts_trigram` | Triggered on INSERT/UPDATE/DELETE (gated by the rebuild-progress predicate) | External-content over the `messages_fts_src` projection; rebuilt on schema migration |
+| Byte-fidelity API view of a user turn | `state.db` → `messages.api_content` | Backfilled at preflight compaction / known-row backfill | Restored VERBATIM so resume re-sends exactly what the model saw |
 | Turn to external provider | Provider backend | End of turn (`sync_all`) | Background ThreadPool; skill scaffolding stripped |
 | Prefetch context for next turn | Provider backend | End of turn (`queue_prefetch`) | Cached, consumed by `prefetch()` on next turn |
 | End-of-session extraction | Provider backend | Session boundary (`on_session_end`) | Full message list passed; not per-turn |
@@ -621,7 +688,7 @@ The system prompt is frozen and identical on every API request, so providers wit
 
 The Hermes codebase treats memory-related tests as integration-critical:
 
-- **E2E state DB tests** (`tests/test_hermes_state.py`) exercise real SQLite operations against temp databases, including FTS5 queries, CJK fallback, malformed-schema recovery, WAL fallback, and compression-lock races.
+- **E2E state DB tests** (`tests/hermes_state/`) exercise real SQLite operations against temp databases, including FTS5 queries, CJK fallback, malformed-schema recovery, WAL fallback and cross-VM WAL refusal, the read pool, and compression-lock races.
 - **Memory provider contract tests** (`tests/agent/test_memory_provider.py`) verify the `MemoryManager` fan-out, tool-name conflict rejection, skill-scaffolding stripping, metadata mode negotiation, and background sync serialization.
 - **Session search tests** (`tests/tools/test_session_search.py`) validate the four calling shapes, cross-profile resolution, lineage deduplication, and scroll anchoring.
 - **Write-approval tests** (`tests/tools/test_write_approval.py`) gate memory mutations inline and via staging.
@@ -638,8 +705,9 @@ Many memory operations need a side LLM call: compressing conversation context be
 
 - **Single resolution chain** — every consumer (context compression, session search title generation, web extraction, vision analysis, browser vision, memory flush) picks up the best available backend without duplicating fallback logic.
 - **Credit-exhaustion resilience** — when a provider returns HTTP 402 or a credit-related error, `call_llm()` walks to the next candidate automatically.
+- **Recovery ladder** — retries are a structured ladder of named rungs, not ad-hoc retry code: parameter-strip rungs (drop `temperature`, drop `max_tokens` — a reasoning-strip retry can 400 on temperature, so parameter rungs chain in any order), then credential rungs (auth / payment / rate-limit errors), then a provider-fallback rung with an ordered (predicate, reason) classification — a payment-flavoured 429 reads as "payment error", not "rate limit" — plus timeout/connection and status-less structured-provider-error rungs. A per-fallback-entry `timeout` replaces deadline inheritance: a fallback previously inherited the primary's exact deadline, killing healthy-but-slower fallbacks (#62452).
 - **Lazy openai import** — the module does not import the OpenAI SDK at top level (it costs ~240 ms cold). Instead it exposes `_OpenAIProxy`, a lazy proxy that loads the real class on the first `OpenAI(...)` invocation.
-- **Temperature and compaction overrides** — certain models have strict server-side contracts. The client returns `OMIT_TEMPERATURE` for Kimi/Moonshot models (whose gateways manage temperature internally) and clamps Arcee Trinity Large Thinking to `0.5`. It also raises the context-compression threshold to `0.85` for Codex GPT-5.5 because the backend caps the effective window at 272K, making the default 50% trigger wastefully early.
+- **Temperature and compaction overrides** — certain models have strict server-side contracts. The client returns `OMIT_TEMPERATURE` for models whose gateways manage temperature internally (Kimi/Moonshot, OpenAI reasoning families) and clamps Arcee Trinity Large Thinking to `0.5`. It also raises the context-compression threshold to `0.85` for the 272K-capped Codex GPT-5.x family (prefix-matched so `-pro` and dated snapshots track it) because the backend caps the effective window, making the default 50% trigger wastefully early.
 
 ### 11.2 Resolution order (auto mode)
 
@@ -653,15 +721,17 @@ For **text** tasks:
 
 For **vision/multimodal** tasks the order is similar but skips providers without vision support (e.g. Kimi Coding Plan routes, which have no image input capability).
 
-Per-task overrides live in `config.yaml` under the `auxiliary:` section (e.g. `auxiliary.compression.provider`, `auxiliary.vision.model`).
+Per-task overrides live in `config.yaml` under the `auxiliary:` section (e.g. `auxiliary.compression.provider`, `auxiliary.vision.model`). Plugins can also contribute aux slots: a plugin-declared slot is read at call time and, unless the user pins a value, *inherits* from its base slot — and a plugin slot that inherits the main key only borrows it on the identical origin, so a plugin can't silently exfiltrate the user's primary credential to a different endpoint.
 
-### 11.3 Codex adapter
+Plugin hooks `pre_auxiliary_call` / `post_auxiliary_call` fire once per physical provider attempt around every auxiliary LLM call, giving plugins observability and veto points without touching the resolution chain.
 
-The Codex backend (`chatgpt.com/backend-api/codex`) speaks the OpenAI **Responses** API, not the standard `chat.completions` surface. The auxiliary client therefore ships `_CodexCompletionsAdapter`, a shim that:
-- Translates `chat.completions.create(messages=[...])` into `responses.create(input=[...], instructions=..., model=...)`.
-- Uses the shared `_chat_messages_to_responses_input()` converter from `agent/codex_responses_adapter.py` so tool history is encoded identically to the main agent transport.
-- Supports a total-timeout timer that closes the client and evicts the cached instance on expiry, preventing a dead Responses stream from hanging the CLI indefinitely.
-- Wraps both sync and async surfaces (`CodexAuxiliaryClient` and `AsyncCodexAuxiliaryClient`) so every consumer can call it without knowing the transport shape.
+### 11.3 Transport adapters
+
+The auxiliary client wraps several non-`chat.completions` backends behind the standard surface so consumers never learn the transport shape:
+
+- **Codex** (`chatgpt.com/backend-api/codex`) speaks the OpenAI **Responses** API. `_CodexCompletionsAdapter` translates `chat.completions.create(messages=[...])` into `responses.create(...)`, using the shared `_chat_messages_to_responses_input()` converter from `agent/codex_responses_adapter.py` so tool history is encoded identically to the main agent transport. A total-timeout timer closes the client and evicts the cached instance on expiry, preventing a dead Responses stream from hanging the CLI indefinitely. Both sync and async surfaces are wrapped (`CodexAuxiliaryClient` / `AsyncCodexAuxiliaryClient`). Response normalization is route-aware: completion status and phase are preserved, an unfinished non-server-side item is treated as a partial, and leak-like text that only reached the model via `output_text` is rescued rather than dropped.
+- **Anthropic** — `_AnthropicCompletionsAdapter` + `AnthropicAuxiliaryClient` / `AsyncAnthropicAuxiliaryClient` speak the Messages API for native Anthropic routes.
+- **Bedrock** — `_BedrockCompletionsAdapter` + `BedrockAuxiliaryClient` / `AsyncBedrockAuxiliaryClient` route GPT-6-family and prefixed OpenAI inference profiles through AWS Bedrock with their 1M-window sizing.
 
 ### 11.4 Portal attribution
 
@@ -747,7 +817,7 @@ Sessions in Hermes are not monolithic. Three kinds of lineage split the conversa
 
 When a session is **deleted** (e.g. `/delete` or prune), delegate subagent runs are cascade-deleted via the `_delegate_from` marker, while branch children are preserved. Orphaned untagged children (older sessions with no title and ≤25 messages that contain tool rows) are also left alone because they might be subagent runs whose parent was already deleted.
 
-Gateway session recovery via `find_latest_gateway_session_for_peer()` treats `end_reason='agent_close'` and `end_reason='ws_orphan_reap'` as recoverable — sessions ended by these reasons can be resumed rather than orphaned. The `ws_orphan_reap` reason (from dashboard viewer disconnect bugs, fixed in #60609) was previously unrecoverable, leaving gateway sessions silently abandoned after a viewer disconnect.
+Gateway session recovery via `find_latest_gateway_session_for_peer()` treats `agent_close`, `ws_orphan_reap`, `superseded_by_resume`, and `startup_orphan_reap` as recoverable — sessions ended by these reasons can be resumed rather than orphaned (§3.6). The `ws_orphan_reap` reason (from dashboard viewer disconnect bugs, fixed in #60609) was previously unrecoverable, leaving gateway sessions silently abandoned after a viewer disconnect.
 
 ---
 
@@ -785,12 +855,17 @@ The agent is designed so that the external provider, which is by far the slowest
 
 | Symptom | Likely cause | Automatic recovery |
 |---|---|---|
-| Session DB not available | NFS/SMB filesystem blocking WAL | Falls back to `journal_mode=DELETE`; logs one warning per process |
+| Session DB not available | NFS/SMB/ZFS/FUSE filesystem blocking WAL | Falls back to `journal_mode=DELETE`; logs one warning per process |
+| WAL refused on this machine | Linked SQLite carries the WAL-reset bug (3.7.0–3.51.2; fixed 3.51.3+, backports 3.50.7/3.44.6) | `hermes_state_wal` keeps the database on DELETE and names the build in the warning; `hermes_cli/sqlite_runtime.py` probes report the version so installers can fix it |
 | btree corruption on macOS (`btreeInitPage error 11`) | macOS `fsync()` doesn't guarantee durability; WAL checkpoint race with process termination (launchd shutdown) | `_enforce_macos_synchronous_full()` sets `synchronous=FULL`; `_apply_macos_checkpoint_barrier()` enables `checkpoint_fullfsync=1` (F_FULLFSYNC at checkpoint boundaries) |
+| Reads slow under many profiles / high fd pressure | Read-connection ceilings reached, or the process is near EMFILE | Readers degrade to the shared writer connection (slower, not wedged); `hermes_state_readpool.py` bounds 8 per file / 24 per process with a 64-fd reserve |
 | FTS5 module missing | Python built without FTS5 | Disables full-text search; message persistence still works |
+| FTS5 checksum mismatch | Index and table disagreed on indexed content | Rebuilt on demand; the index reads from the stable `messages_fts_src` projection so rebuild and triggers can't disagree again |
 | Malformed schema (duplicate messages_fts) | Crash during FTS5 creation | Auto-repair: de-duplicate `sqlite_master`, or drop FTS and rebuild from messages |
 | Memory file drift | Patch tool / manual edit / concurrent session | Detected at mutation time; backup created; mutation refused with remediation instructions |
-| External provider timeout | Network / backend overload | Background executor absorbs it; turn completes for user |
+| External provider timeout | Network / backend overload | Prefetch bounded at 8 s; sync work goes to the background executor; turn completes for user |
+| Provider hung on shutdown | Backend wedged past the drain deadline | `shutdown_all()` abandons the queue after 5 s and reports exactly what it dropped (`shutdown_drain_state`) |
+| Configured provider missing | Provider left core (catalog migration pending) | `hermes update` and agent init install the catalog plugin and surface every outcome to the user (§5.6) |
 | Memory provider tool name collision | Plugin registers `clarify` or `delegate_task` | Rejected at registration; core tools always win |
 | Poisoned memory entry | Threat pattern in MEMORY.md | Entry blocked from system prompt snapshot; user sees `[BLOCKED: …]` placeholder and can remove it |
 
@@ -800,15 +875,27 @@ The agent is designed so that the external provider, which is by far the slowest
 
 | File | Responsibility |
 |---|---|
-| `tools/memory_tool.py` | `MemoryStore`, `memory_tool()` entry point, write-approval gate, threat scanning, drift detection |
-| `hermes_state.py` | `SessionDB`, `workspace_key()`, WAL fallback, macOS `synchronous=FULL` enforcement, schema reconciliation, FTS5 setup, message CRUD (incl. `effect_disposition`), per-model usage attribution, compression locks, compression lineage cycle detection, session import |
-| `tools/session_search_tool.py` | `session_search()` tool with four shapes (discover, scroll, read, browse), cross-profile resolution |
-| `agent/memory_manager.py` | `MemoryManager`, provider orchestration, background executor, context fencing, tool injection, skill-scaffolding strip |
-| `agent/memory_provider.py` | `MemoryProvider` ABC defining the lifecycle contract for all external backends |
-| `plugins/memory/__init__.py` | Provider discovery (bundled + user-installed), `load_memory_provider()`, synthetic package registration |
-| `agent/auxiliary_client.py` | `call_llm()`, provider resolution chains, Codex adapter, Portal attribution, temperature/compaction overrides |
-| `agent/agent_init.py` | Wiring `MemoryStore`, `MemoryManager`, external provider init, profile-scoped kwargs assembly |
-| `run_agent.py` | `_sync_external_memory_for_turn()`, `shutdown_memory_provider()`, `commit_memory_session()`, interrupt gating |
+| `tools/memory_tool.py` | `memory` tool entry point, config wiring, write-approval glue, staged-entry pinning; re-exports from the store |
+| `tools/memory_tool_store.py` | `MemoryStore`: entry lifecycle, batch ops, file locking, threat scanning, drift detection, consolidation-failure cap |
+| `hermes_state.py` | `SessionDB` facade: connection setup, write-retry patience budgets, checkpoint/FTS-merge cadence, session import |
+| `hermes_state_common.py` | Canonical `SCHEMA_SQL`, `SCHEMA_VERSION`, `_RECOVERABLE_END_REASONS`, `_LISTABLE_CHILD_SQL` |
+| `hermes_state_schema.py` | Schema migration chain, `_reconcile_columns()`, FTS5 setup incl. the `messages_fts_src` projection and deferred-rebuild protocol |
+| `hermes_state_wal.py` | WAL application/fallback, WAL-reset-bug refusal, WAL size limit, macOS `synchronous=FULL` / `checkpoint_fullfsync` |
+| `hermes_state_readpool.py` | Read-connection budgeting (per-file/process permits, fd-headroom gate) |
+| `hermes_state_pidns.py` / `hermes_state_lockowners.py` / `hermes_state_lockguard.py` | PID-namespace-qualified lock/lease holder probing and write-lock holder diagnostics |
+| `hermes_state_messages.py` | Message CRUD incl. `message_uid`, `api_content` sidecar, display identity/order, compaction-aware restore |
+| `hermes_state_compression.py` | Compression locks/leases, lineage walk with cycle detection, fallback streak |
+| `hermes_state_sessions.py` | Session CRUD, `workspace_key()`, listing/deletion/prune guards |
+| `hermes_state_gateway.py`, `hermes_state_telegram.py`, `hermes_state_rewind.py`, `hermes_state_usage.py`, `hermes_state_titles.py`, `hermes_state_search.py`, `hermes_state_repair.py`, `hermes_state_health.py`, … | Further SessionDB mixins (gateway recovery, rewind, per-model usage, titles, search, repair, health) |
+| `tools/session_search_tool.py` | `session_search()` tool with four shapes (discover, scroll, read, browse), explicit cross-profile reads |
+| `agent/memory_manager.py` | `MemoryManager`, provider orchestration, background executor + bounded drain, recall indicator, context fencing, tool injection, skill-scaffolding strip |
+| `agent/memory_provider.py` | `MemoryProvider` ABC defining the lifecycle contract; `ctx_bound` contextvars propagation; `is_trivial_prompt` recall gate |
+| `plugins/memory/__init__.py` | Provider discovery (bundled → user → project → entry points), `load_memory_provider()`, synthetic package registration |
+| `plugins/memory/<name>/` | Bundled providers: byterover, holographic, openviking, retaindb |
+| `hermes_cli/memory_provider_migration.py` | Catalog migration for providers that left core; outcomes surfaced at startup and on `hermes update` |
+| `agent/auxiliary_client.py` | `call_llm()`, provider resolution chains, recovery ladder, Codex/Anthropic/Bedrock adapters, Portal attribution, temperature/compaction overrides |
+| `agent/agent_init.py` | Wiring `MemoryStore`, `MemoryManager`, external provider init (incl. `recover_at_startup`), profile-scoped kwargs assembly |
+| `run_agent.py` | `_sync_external_memory_for_turn()`, `shutdown_memory_provider()`, `commit_memory_session()`, trivial-prompt recall gate, interrupt gating |
 | `tools/write_approval.py` | Inline / staged approval gate for memory and skill writes |
 | `tools/threat_patterns.py` | Injection/exfil pattern scanner used by memory, skills, and context-file loaders |
 
@@ -820,7 +907,7 @@ Hermes’ memory system is deliberately layered:
 
 - **Core memory** (`MemoryStore`) gives the agent fast, bounded, curated notes that ride in the system prompt — frozen for the entire session to protect the API prefix cache.
 - **Session storage** (`SessionDB`) gives durable, full-text-searchable conversation history with zero LLM overhead, powering the `session_search` tool, the dashboard sidebar, and all analytics.
-- **Pluggable providers** (`MemoryManager` + `MemoryProvider` ABC) give users the option to sync conversation state to external backends (Honcho, Mem0, Supermemory, …), but only one at a time to keep the tool surface small and predictable.
+- **Pluggable providers** (`MemoryManager` + `MemoryProvider` ABC) give users the option to sync conversation state to external backends (bundled: Byterover, Holographic, OpenViking, RetainDB; formerly-bundled Honcho/Mem0/Supermemory/Hindsight now install from the plugin catalog with an automatic migration), but only one at a time to keep the tool surface small and predictable.
 - **Auxiliary client** (`agent/auxiliary_client.py`) gives memory-related side tasks a reliable, fallback-rich LLM client without duplicating provider logic in every subsystem.
 
 All three layers are coordinated through a single manager, background workers isolate slow backends from the hot path, and multiple hard boundaries (threat scanning, context fencing, drift detection, WAL-fallback, schema self-repair, compression-locking) keep the system resilient against corruption, attack, environmental variance, and provider outage.
