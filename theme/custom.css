@@ -12,6 +12,14 @@
 
 @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
 
+/* Wider content column than mdBook's 750px default — less dead margin */
+:root,
+.light,
+.coal {
+    --content-max-width: 1100px;
+    --page-padding: 32px;
+}
+
 /* ─── Type ───────────────────────────────────────────────────────────── */
 
 :root,
